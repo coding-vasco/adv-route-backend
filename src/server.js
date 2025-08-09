@@ -1,5 +1,5 @@
 // src/server.js — CH + STITCH + geocoding + auto-BBox
-// Adds: pretty download redirects + browser preview page
+// Adds: alias anchors, snap-to-road, pretty download redirects, browser preview page
 
 import 'dotenv/config';
 import express from 'express';
@@ -64,6 +64,19 @@ const tryParseCommaPair = (s) => {
   return [a, b]; // assume lon,lat
 };
 
+// --- Common anchor aliases -> stable coordinates (lon,lat)
+const anchorAliases = [
+  { re: /ponte.*25.*abril|25\s*de\s*abril/i, coord: [-9.1488, 38.6997] },     // 25 de Abril deck
+  { re: /cabo\s+espichel/i, coord: [-9.209, 38.414] },                         // rough Cabo Espichel
+  { re: /arr[aá]bida/i, coord: [-9.020, 38.480] },                             // Arrábida area
+];
+
+function aliasToCoord(s) {
+  const txt = String(s || '');
+  for (const a of anchorAliases) if (a.re.test(txt)) return a.coord;
+  return null;
+}
+
 // GraphHopper Geocoder (separate from routing)
 const geocodeGH = async (text) => {
   const u = `https://graphhopper.com/api/1/geocode?q=${encodeURIComponent(text)}&limit=1&locale=en&key=${GH_KEY}`;
@@ -91,6 +104,10 @@ const parsePointOrGeocode = async (input) => {
   if (input && typeof input === 'object' && 'lon' in input && 'lat' in input) {
     return [Number(input.lon), Number(input.lat)];
   }
+  // alias first
+  const alias = aliasToCoord(input);
+  if (alias) return alias;
+
   const s = String(input).trim();
   const pair = tryParseCommaPair(s);
   if (pair) return pair; // already lon,lat (or fixed)
@@ -202,29 +219,27 @@ function selectTracksAlongAxis(tracks, start, end, {max=6, maxAxisKm=8}) {
   }
   return out.sort((a,b)=>a.t-b.t);
 }
-async function buildStitchedRoute(start, end, vias, tracks){
-  const selected = selectTracksAlongAxis(tracks, start, end, {max:6, maxAxisKm:8});
-  const anchors = [start, ...vias, ...selected.map(s=>s.coords[0]), end];
-  const segments = [];
-  let last = anchors[0];
-  for (let i=1;i<anchors.length;i++){
-    const next = anchors[i];
-    const gh = await ghRouteCH([last, next], 'car');
-    const coords = gh.paths[0].points.coordinates.map(c=>[c[0],c[1]]);
-    segments.push({type:'connector', coords});
-    last = next;
+
+// Try to snap a coordinate to nearest routable point using a micro CH route
+async function snapToRoad([lon, lat]) {
+  const meters = [50, 120, 250, 400, 600, 900];
+  const bearings = [0, 60, 120, 180, 240, 300];
+  const dLat = (m) => m / 111000;
+  const dLon = (m) => m / (111000 * Math.cos(toRad(lat)) || 1);
+
+  for (const m of meters) {
+    for (const b of bearings) {
+      const rad = Math.PI * b / 180;
+      const dx = Math.cos(rad) * dLon(m);
+      const dy = Math.sin(rad) * dLat(m);
+      try {
+        const gh = await ghRouteCH([[lon, lat], [lon + dx, lat + dy]], 'car');
+        const snapped = gh.paths?.[0]?.points?.coordinates?.[0];
+        if (snapped) return [snapped[0], snapped[1]];
+      } catch { /* try next offset */ }
+    }
   }
-  const merged=[]; let selIdx=0;
-  for (const seg of segments){
-    merged.push(seg);
-    const track = selected[selIdx];
-    const endPt = seg.coords[seg.coords.length-1];
-    if (track && distKm(endPt, track.coords[0]) < 0.15) { merged.push({type:'track', id:track.id, coords:track.coords}); selIdx++; }
-  }
-  const all=[];
-  for (const s of merged){ if (all.length) all.pop(); all.push(...s.coords); }
-  const evidence = selected.map(s=>({type:'OSM_track', ref:s.id, km:+s.len.toFixed(2)}));
-  return { coords: all, evidence };
+  return [lon, lat];
 }
 
 /* ========= API ========= */
@@ -236,10 +251,16 @@ app.post('/plan', async (req, res) => {
     if (!start || !end) return res.status(400).json({ error: 'start and end are required (address/place or lon,lat)' });
 
     // Geocode/parse inputs
-    const a = await parsePointOrGeocode(start);
-    const b = await parsePointOrGeocode(end);
+    const a0 = await parsePointOrGeocode(start);
+    const b0 = await parsePointOrGeocode(end);
+    const viaRaw = [];
+    for (const v of vias) viaRaw.push(await parsePointOrGeocode(v));
+
+    // Snap to road network (improves CH success for vague points)
+    const a = await snapToRoad(a0);
+    const b = await snapToRoad(b0);
     const viaPts = [];
-    for (const v of vias) viaPts.push(await parsePointOrGeocode(v));
+    for (const v of viaRaw) viaPts.push(await snapToRoad(v));
 
     // BBox: use provided or derive
     const bbox = Array.isArray(region_hint_bbox) && region_hint_bbox.length===4
@@ -252,7 +273,30 @@ app.post('/plan', async (req, res) => {
     let coords, note; const evidence = [{ type:'GH_mode', ref:'CH' }];
 
     if (strategy === 'stitch') {
-      const built = await buildStitchedRoute(a, b, viaPts, tracks);
+      const built = await (async () => {
+        const selected = selectTracksAlongAxis(tracks, a, b, {max:6, maxAxisKm:8});
+        const anchors = [a, ...viaPts, ...selected.map(s=>s.coords[0]), b];
+        const segments = [];
+        let last = anchors[0];
+        for (let i=1;i<anchors.length;i++){
+          const next = anchors[i];
+          const gh = await ghRouteCH([last, next], 'car');
+          const coords = gh.paths[0].points.coordinates.map(c=>[c[0],c[1]]);
+          segments.push({type:'connector', coords});
+          last = next;
+        }
+        const merged=[]; let selIdx=0;
+        for (const seg of segments){
+          merged.push(seg);
+          const track = selected[selIdx];
+          const endPt = seg.coords[seg.coords.length-1];
+          if (track && distKm(endPt, track.coords[0]) < 0.15) { merged.push({type:'track', id:track.id, coords:track.coords}); selIdx++; }
+        }
+        const all=[]; for (const s of merged){ if (all.length) all.pop(); all.push(...s.coords); }
+        const evidence = selected.map(s=>({type:'OSM_track', ref:s.id, km:+polylineLenKm(s.coords).toFixed(2)}));
+        return { coords: all, evidence };
+      })();
+
       coords = built.coords;
       evidence.push(...built.evidence);
       note = 'STITCH mode: CH connectors + OSM tracks (no Custom Model).';
