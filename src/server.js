@@ -1,4 +1,5 @@
-// src/server.js — CH + STITCH, now with built-in geocoding & auto-BBox
+// src/server.js — CH + STITCH + geocoding + auto-BBox
+// Adds: pretty download redirects + browser preview page
 
 import 'dotenv/config';
 import express from 'express';
@@ -23,7 +24,7 @@ need('STORAGE');
 need('SUPABASE_URL');
 need('SUPABASE_SERVICE_ROLE');
 need('SUPABASE_BUCKET');
-need('PUBLIC_BASE_URL', false);
+need('PUBLIC_BASE_URL', false); // optional, but used for pretty links
 
 if (process.env.STORAGE !== 'SUPABASE') {
   console.error('[ENV] STORAGE must be SUPABASE for this build.');
@@ -37,6 +38,7 @@ const SUPABASE_SERVICE_ROLE = process.env.SUPABASE_SERVICE_ROLE;
 const SUPABASE_BUCKET = process.env.SUPABASE_BUCKET;
 const SUPABASE_PUBLIC_BUCKET =
   String(process.env.SUPABASE_PUBLIC_BUCKET || 'true').toLowerCase() === 'true';
+const PUBLIC_BASE_URL = (process.env.PUBLIC_BASE_URL || '').replace(/\/$/, '');
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE, { auth: { persistSession: false } });
 const nanoid = customAlphabet('abcdefghijklmnopqrstuvwxyz0123456789', 12);
@@ -62,7 +64,7 @@ const tryParseCommaPair = (s) => {
   return [a, b]; // assume lon,lat
 };
 
-// GraphHopper Geocoder (free to use, separate from routing mode)
+// GraphHopper Geocoder (separate from routing)
 const geocodeGH = async (text) => {
   const u = `https://graphhopper.com/api/1/geocode?q=${encodeURIComponent(text)}&limit=1&locale=en&key=${GH_KEY}`;
   const r = await fetch(u);
@@ -85,7 +87,6 @@ const geocodeNominatim = async (text) => {
 };
 
 const parsePointOrGeocode = async (input) => {
-  // Array, object with lon/lat, or string
   if (Array.isArray(input)) return [Number(input[0]), Number(input[1])];
   if (input && typeof input === 'object' && 'lon' in input && 'lat' in input) {
     return [Number(input.lon), Number(input.lat)];
@@ -93,7 +94,6 @@ const parsePointOrGeocode = async (input) => {
   const s = String(input).trim();
   const pair = tryParseCommaPair(s);
   if (pair) return pair; // already lon,lat (or fixed)
-  // Geocode free-form text
   try {
     const g = await geocodeGH(s);
     return [g.lon, g.lat];
@@ -161,6 +161,20 @@ const uploadToSupabase = async (path, buffer, contentType) => {
     return signed.signedUrl;
   }
 };
+
+// Get a public (or signed) URL for an existing storage path
+async function storageUrlFor(path) {
+  if (SUPABASE_PUBLIC_BUCKET) {
+    const { data } = supabase.storage.from(SUPABASE_BUCKET).getPublicUrl(path);
+    return data.publicUrl;
+  } else {
+    const { data, error } = await supabase
+      .storage.from(SUPABASE_BUCKET)
+      .createSignedUrl(path, 60 * 60); // 1 hour
+    if (error) throw error;
+    return data.signedUrl;
+  }
+}
 
 /* ========= STITCH helpers ========= */
 const lerp = (a,b,t)=>[a[0]+(b[0]-a[0])*t, a[1]+(b[1]-a[1])*t];
@@ -255,6 +269,11 @@ app.post('/plan', async (req, res) => {
     const geojsonBlob = Buffer.from(JSON.stringify({ type:'Feature', properties:{ name:'ADV Route' }, geometry:{ type:'LineString', coordinates: coords }}));
     const geojsonUrl = await uploadToSupabase(`routes/${routeId}.geojson`, geojsonBlob, 'application/geo+json');
 
+    // Pretty links + preview URL
+    const previewUrl  = PUBLIC_BASE_URL ? `${PUBLIC_BASE_URL}/v/${routeId}` : null;
+    const prettyGpx   = PUBLIC_BASE_URL ? `${PUBLIC_BASE_URL}/download/route/${routeId}.gpx` : gpxUrl;
+    const prettyGeo   = PUBLIC_BASE_URL ? `${PUBLIC_BASE_URL}/download/route/${routeId}.geojson` : geojsonUrl;
+
     res.json({
       routes: [{
         id: routeId,
@@ -263,7 +282,9 @@ app.post('/plan', async (req, res) => {
         stats: { distance_km: +polylineLenKm(coords).toFixed(1), duration_h: null, ascent_m: null },
         gpx_url: gpxUrl,
         geojson_url: geojsonUrl,
-        preview_url: null,
+        preview_url: previewUrl,
+        pretty_gpx_url: prettyGpx,
+        pretty_geojson_url: prettyGeo,
         custom_model_used: null,
         via_points_used: [a, ...viaPts, b]
       }],
@@ -272,6 +293,85 @@ app.post('/plan', async (req, res) => {
   } catch (e) {
     console.error(e);
     res.status(500).json({ error: String(e) });
+  }
+});
+
+// Pretty download URLs -> redirect to Supabase
+app.get('/download/route/:id.:ext', async (req, res) => {
+  try {
+    const { id, ext } = req.params;
+    if (!['gpx', 'geojson'].includes(ext)) return res.status(400).send('bad extension');
+    const path = `routes/${id}.${ext}`;
+    const url = await storageUrlFor(path);
+    if (!url) return res.status(404).send('not found');
+    return res.redirect(302, url);
+  } catch (e) {
+    console.error(e);
+    res.status(500).send('server error');
+  }
+});
+
+// Lightweight Leaflet preview page
+app.get('/v/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const geoUrl = await storageUrlFor(`routes/${id}.geojson`);
+    if (!geoUrl) return res.status(404).send('route not found');
+
+    const prettyGpx  = PUBLIC_BASE_URL ? `${PUBLIC_BASE_URL}/download/route/${id}.gpx` : geoUrl;
+    const prettyGeo  = PUBLIC_BASE_URL ? `${PUBLIC_BASE_URL}/download/route/${id}.geojson` : geoUrl;
+
+    res.set('content-type', 'text/html; charset=utf-8').send(`<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>ADV Route – ${id}</title>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+  <style>
+    html, body { height:100%; margin:0; }
+    #map { position:absolute; inset:0; }
+    .panel {
+      position:absolute; left:0; right:0; bottom:0;
+      display:flex; gap:.5rem; justify-content:center; flex-wrap:wrap;
+      padding:.6rem; background: rgba(255,255,255,.92);
+      box-shadow: 0 -4px 12px rgba(0,0,0,.12);
+      font: 14px/1.2 system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif;
+    }
+    .btn {
+      text-decoration:none; padding:.55rem .8rem; border-radius:10px;
+      border:1px solid #ccc; background:#fff; color:#111;
+    }
+  </style>
+</head>
+<body>
+  <div id="map"></div>
+  <div class="panel">
+    <a class="btn" href="${prettyGpx}" target="_blank">Download GPX</a>
+    <a class="btn" href="${prettyGeo}" target="_blank">Download GeoJSON</a>
+  </div>
+
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <script>
+    const map = L.map('map', { zoomControl: true });
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+      maxZoom: 19, attribution: '&copy; OpenStreetMap'
+    }).addTo(map);
+
+    fetch(${JSON.stringify(geoUrl)})
+      .then(r => r.json())
+      .then(geo => {
+        const layer = L.geoJSON(geo, { style: { weight: 4, opacity: .9 } }).addTo(map);
+        try { map.fitBounds(layer.getBounds(), { padding: [24,24] }); }
+        catch { map.setView([38.72,-9.14], 12); }
+      })
+      .catch(() => map.setView([38.72,-9.14], 12));
+  </script>
+</body>
+</html>`);
+  } catch (e) {
+    console.error(e);
+    res.status(500).send('server error');
   }
 });
 
