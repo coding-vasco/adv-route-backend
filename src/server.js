@@ -1,3 +1,5 @@
+// src/server.js — GraphHopper CH-only (free plan) + STITCH mode, Supabase uploads
+
 import 'dotenv/config';
 import express from 'express';
 import fetch from 'node-fetch';
@@ -7,26 +9,28 @@ import { customAlphabet } from 'nanoid';
 const app = express();
 app.use(express.json({ limit: '2mb' }));
 
-/* ========= ENV & VALIDATION ========= */
+/* ========= ENV & CLIENTS ========= */
 
-const need = (k) => {
+const need = (k, hard = true) => {
   if (!process.env[k] || String(process.env[k]).trim() === '') {
-    console.error(`[ENV] Missing ${k}`);
-    process.exit(1);
+    const msg = `[ENV] Missing ${k}`;
+    if (hard) { console.error(msg); process.exit(1); }
+    else { console.warn(msg); }
   }
 };
 
 need('GH_KEY');
 need('OVERPASS_URL');
 need('STORAGE');
-need('PUBLIC_BASE_URL');
-if (process.env.STORAGE !== 'SUPABASE') {
-  console.error('[ENV] STORAGE must be SUPABASE for this build');
-  process.exit(1);
-}
 need('SUPABASE_URL');
 need('SUPABASE_SERVICE_ROLE');
 need('SUPABASE_BUCKET');
+need('PUBLIC_BASE_URL', false); // optional for now
+
+if (process.env.STORAGE !== 'SUPABASE') {
+  console.error('[ENV] STORAGE must be SUPABASE for this build.');
+  process.exit(1);
+}
 
 const GH_KEY = process.env.GH_KEY;
 const OVERPASS_URL = process.env.OVERPASS_URL;
@@ -42,40 +46,13 @@ const nanoid = customAlphabet('abcdefghijklmnopqrstuvwxyz0123456789', 12);
 /* ========= HELPERS ========= */
 
 const parsePoint = (p) => {
-  if (typeof p === 'string') {
-    const [lon, lat] = p.split(',').map(Number);
-    return [lon, lat];
-  }
+  if (typeof p === 'string') { const [lon, lat] = p.split(',').map(Number); return [lon, lat]; }
   if (Array.isArray(p)) return [Number(p[0]), Number(p[1])];
   if (p && typeof p === 'object' && 'lon' in p && 'lat' in p) return [Number(p.lon), Number(p.lat)];
   throw new Error(`Bad point format: ${JSON.stringify(p)}`);
 };
 
-const buildCustomModel = (prefs = {}) => {
-  const mustUseAreas = prefs.must_use_areas || []; // GeoJSON Features with "id"
-  return {
-    distance_influence: 8,
-    priority: [
-      { if: 'road_environment == FERRY', multiply_by: '0.01' },
-      { if: 'road_class == MOTORWAY || road_class == TRUNK', multiply_by: '0.2' },
-      { if: 'road_class == PRIMARY', multiply_by: '0.5' },
-      { if: 'surface == ASPHALT || surface == PAVED', multiply_by: '0.9' },
-      { if: 'surface == SAND', multiply_by: '0.25' },
-      { if: 'track_type == GRADE4 || track_type == GRADE5', multiply_by: '0.7' },
-      { if: 'road_class == PATH || road_class == FOOTWAY || road_class == PEDESTRIAN || road_class == STEPS', multiply_by: '0.01' },
-      ...mustUseAreas.map((f) => ({
-        if: `in_${f.id} && (road_class == MOTORWAY || road_class == TRUNK)`,
-        multiply_by: '1'
-      }))
-    ],
-    speed: [
-      { if: 'road_class == TRACK', limit_to: '45' },
-      { if: 'track_type == GRADE4 || track_type == GRADE5', limit_to: '35' }
-    ],
-    areas: { type: 'FeatureCollection', features: mustUseAreas }
-  };
-};
-
+// Overpass candidate tracks (gravelish, grade 1–3)
 const overpassTracks = async (bbox /* [south,west,north,east] */) => {
   if (!bbox) return [];
   const [south, west, north, east] = bbox;
@@ -95,21 +72,25 @@ out geom;`;
   }));
 };
 
-const ghRoute = async (points, custom_model) => {
+// CH-only routing (free plan): no custom_model, no "ch.disable"
+const ghRouteCH = async (points, profile = 'car') => {
   const body = {
-    profile: 'car',
+    profile,
     points: points.map(([lon, lat]) => [lon, lat]),
     points_encoded: false,
     instructions: false,
-    locale: 'en',
-    details: ['surface', 'road_class'],
-    'ch.disable': true,
-    custom_model
+    locale: 'en'
   };
   const url = `https://graphhopper.com/api/1/route?key=${GH_KEY}`;
-  const r = await fetch(url, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) });
+  const r = await fetch(url, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(body)
+  });
   if (!r.ok) throw new Error(`GraphHopper error: ${await r.text()}`);
-  return r.json();
+  const j = await r.json();
+  j._routing_mode = 'CH';
+  return j;
 };
 
 const toGPX = (name, coords) => `<?xml version="1.0"?>
@@ -138,6 +119,83 @@ const uploadToSupabase = async (path, buffer, contentType) => {
   }
 };
 
+/* ====== small geo utils for STITCH mode ====== */
+const toRad = (deg) => deg * Math.PI / 180;
+const distKm = ([lon1,lat1],[lon2,lat2]) => {
+  const R=6371, dLat=toRad(lat2-lat1), dLon=toRad(lon2-lon1);
+  const a = Math.sin(dLat/2)**2 + Math.cos(toRad(lat1))*Math.cos(toRad(lat2))*Math.sin(dLon/2)**2;
+  return 2*R*Math.asin(Math.sqrt(a));
+};
+const lerp = (a,b,t)=>[a[0]+(b[0]-a[0])*t, a[1]+(b[1]-a[1])*t];
+const project01 = (p,a,b)=>{ // scalar t along AB where P projects (approx, planar)
+  const ax=a[0], ay=a[1], bx=b[0], by=b[1], px=p[0], py=p[1];
+  const vx=bx-ax, vy=by-ay, wx=px-ax, wy=py-ay;
+  const vv=vx*vx+vy*vy || 1e-9; const t=(vx*wx+vy*wy)/vv; return Math.max(0,Math.min(1,t));
+};
+const polylineLenKm = (coords)=> coords.reduce((s,c,i)=> i? s+distKm(coords[i-1],c):0,0);
+
+// choose up to N track ways near start→end axis and spaced out
+function selectTracksAlongAxis(tracks, start, end, {max=6, maxAxisKm=8}) {
+  const scored = tracks.map(w=>{
+    const coords = w.coords;
+    if (!coords?.length) return null;
+    const mid = coords[Math.floor(coords.length/2)];
+    const t = project01(mid, start, end);
+    const ptOnAxis = lerp(start,end,t);
+    const off = distKm(mid, ptOnAxis);
+    return { id:w.id, coords, t, off, len: polylineLenKm(coords) };
+  }).filter(Boolean)
+    .filter(x => x.off <= maxAxisKm)
+    .sort((a,b)=> a.t-b.t);
+
+  const out=[]; const minGap = 0.1; // ~10% axis spacing
+  for (const cand of scored.sort((a,b)=> b.len-a.len)) {
+    if (out.find(o => Math.abs(o.t - cand.t) < minGap)) continue;
+    out.push(cand);
+    if (out.length>=max) break;
+  }
+  return out.sort((a,b)=> a.t-b.t);
+}
+
+// Build stitched route: CH connectors + selected OSM track polylines
+async function buildStitchedRoute(start, end, vias, tracks, ghRouteCH){
+  const selected = selectTracksAlongAxis(tracks, start, end, {max:6, maxAxisKm:8});
+  const anchors = [start, ...vias, ...selected.map(s=>s.coords[0]), end];
+
+  const segments = [];
+  let last = anchors[0];
+  for (let i=1;i<anchors.length;i++){
+    const next = anchors[i];
+    const gh = await ghRouteCH([last, next], 'car');
+    const coords = gh.paths[0].points.coordinates.map(c=>[c[0],c[1]]);
+    segments.push({type:'connector', coords});
+    last = next;
+  }
+
+  // interleave track lines when a connector lands near a selected track start
+  const merged = [];
+  let selIdx = 0;
+  for (const seg of segments){
+    merged.push(seg);
+    const track = selected[selIdx];
+    const endPt = seg.coords[seg.coords.length-1];
+    if (track && distKm(endPt, track.coords[0]) < 0.15) { // ~150m snap tolerance
+      merged.push({type:'track', id:track.id, coords: track.coords});
+      selIdx++;
+    }
+  }
+
+  // flatten segments to one polyline
+  const allCoords = [];
+  for (const s of merged){
+    if (allCoords.length) allCoords.pop();
+    allCoords.push(...s.coords);
+  }
+
+  const evidence = selected.map(s=>({type:'OSM_track', ref:String(s.id), km:+s.len.toFixed(2)}));
+  return { coords: allCoords, evidence, selected };
+}
+
 /* ========= API ========= */
 
 app.post('/plan', async (req, res) => {
@@ -145,49 +203,55 @@ app.post('/plan', async (req, res) => {
     const {
       start, end, vias = [],
       region_hint_bbox,
-      must_use_areas = [],
-      prefs = {}
+      strategy = 'ch'   // "ch" (default) or "stitch"
     } = req.body;
 
-    const pts = [parsePoint(start), ...vias.map(parsePoint), parsePoint(end)];
-    const custom = buildCustomModel({ must_use_areas, ...prefs });
+    const a = parsePoint(start);
+    const b = parsePoint(end);
+    const viaPts = vias.map(parsePoint);
 
+    // fetch candidate tracks (evidence + stitch inputs)
     const tracks = await overpassTracks(region_hint_bbox).catch(() => []);
 
-    const gh = await ghRoute(pts, custom);
-    const path = gh.paths?.[0];
-    if (!path) throw new Error('No route found');
+    let coords, note, evidence = [{type:'GH_mode', ref:'CH'}];
 
-    const coords = path.points.coordinates.map((c) => [c[0], c[1]]);
+    if (strategy === 'stitch') {
+      const built = await buildStitchedRoute(a, b, viaPts, tracks, ghRouteCH);
+      coords = built.coords;
+      evidence = evidence.concat(built.evidence);
+      note = 'STITCH mode: CH connectors + OSM tracks (no Custom Model).';
+    } else {
+      const gh = await ghRouteCH([a, ...viaPts, b], 'car');
+      coords = gh.paths[0].points.coordinates.map(c=>[c[0],c[1]]);
+      note = 'CH mode: standard routing (free plan).';
+    }
+
+    // files
     const routeId = nanoid();
-
     const gpx = toGPX('ADV Route', coords);
     const gpxUrl = await uploadToSupabase(`routes/${routeId}.gpx`, Buffer.from(gpx), 'application/gpx+xml');
-    const geojsonBlob = Buffer.from(JSON.stringify({ type: 'Feature', geometry: path.points, properties: { name: 'ADV Route' } }));
+    const geojsonBlob = Buffer.from(JSON.stringify({
+      type: 'Feature', properties: { name: 'ADV Route' },
+      geometry: { type:'LineString', coordinates: coords }
+    }));
     const geojsonUrl = await uploadToSupabase(`routes/${routeId}.geojson`, geojsonBlob, 'application/geo+json');
+
+    // simple stats (distance only)
+    const distance_km = +polylineLenKm(coords).toFixed(1);
 
     res.json({
       routes: [{
         id: routeId,
-        name: 'ADV Option 1',
-        summary: 'Backroads-biased',
-        stats: {
-          distance_km: +(path.distance / 1000).toFixed(1),
-          duration_h: +(path.time / 3600000).toFixed(2),
-          ascent_m: path.ascend ?? null
-        },
-        surface_mix: path.details?.surface ?? null,
-        road_class_mix: path.details?.road_class ?? null,
+        name: strategy === 'stitch' ? 'ADV Option (Stitched)' : 'ADV Option (CH)',
+        summary: note,
+        stats: { distance_km, duration_h: null, ascent_m: null },
         gpx_url: gpxUrl,
         geojson_url: geojsonUrl,
         preview_url: null,
-        custom_model_used: custom,
-        via_points_used: pts
+        custom_model_used: null,
+        via_points_used: [a, ...viaPts, b]
       }],
-      evidence: [
-        ...(tracks.slice(0, 5).map(t => ({ type: 'OSM_track', ref: t.id }))),
-        { type: 'GH_ok', ref: 'paths[0]' }
-      ]
+      evidence
     });
   } catch (e) {
     console.error(e);
@@ -196,6 +260,7 @@ app.post('/plan', async (req, res) => {
 });
 
 app.post('/refine', async (req, res) => {
+  // With CH-only, "refine" just re-plans using new points/strategy.
   req.url = '/plan';
   app._router.handle(req, res, () => {});
 });
@@ -203,5 +268,5 @@ app.post('/refine', async (req, res) => {
 app.get('/health', (_, res) => res.json({ ok: true }));
 
 app.listen(process.env.PORT || 8080, () => {
-  console.log(`ADV backend on :${process.env.PORT || 8080}`);
+  console.log(`ADV backend (CH + STITCH) on :${process.env.PORT || 8080}`);
 });
