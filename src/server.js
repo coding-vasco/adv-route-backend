@@ -7,44 +7,41 @@ import { customAlphabet } from 'nanoid';
 const app = express();
 app.use(express.json({ limit: '2mb' }));
 
-/* ========= ENV & CLIENTS ========= */
+/* ========= ENV & VALIDATION ========= */
 
-const required = (key) => {
-  if (!process.env[key] || String(process.env[key]).trim() === '') {
-    console.error(`[ENV] Missing ${key}`);
+const need = (k) => {
+  if (!process.env[k] || String(process.env[k]).trim() === '') {
+    console.error(`[ENV] Missing ${k}`);
     process.exit(1);
   }
 };
 
-required('GH_KEY');
-required('STORAGE');                 // must be SUPABASE
-required('PUBLIC_BASE_URL');
-required('OVERPASS_URL');            // you set a default in .env.example
+need('GH_KEY');
+need('OVERPASS_URL');
+need('STORAGE');
+need('PUBLIC_BASE_URL');
 if (process.env.STORAGE !== 'SUPABASE') {
-  console.error('[ENV] STORAGE must be SUPABASE for this build.');
+  console.error('[ENV] STORAGE must be SUPABASE for this build');
   process.exit(1);
 }
-required('SUPABASE_URL');
-required('SUPABASE_SERVICE_ROLE');
-required('SUPABASE_BUCKET');
+need('SUPABASE_URL');
+need('SUPABASE_SERVICE_ROLE');
+need('SUPABASE_BUCKET');
 
 const GH_KEY = process.env.GH_KEY;
 const OVERPASS_URL = process.env.OVERPASS_URL;
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_ROLE = process.env.SUPABASE_SERVICE_ROLE;
 const SUPABASE_BUCKET = process.env.SUPABASE_BUCKET;
-const SUPABASE_PUBLIC_BUCKET = String(process.env.SUPABASE_PUBLIC_BUCKET || 'true').toLowerCase() === 'true';
+const SUPABASE_PUBLIC_BUCKET =
+  String(process.env.SUPABASE_PUBLIC_BUCKET || 'true').toLowerCase() === 'true';
 
-const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE, {
-  auth: { persistSession: false }
-});
-
+const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE, { auth: { persistSession: false } });
 const nanoid = customAlphabet('abcdefghijklmnopqrstuvwxyz0123456789', 12);
 
 /* ========= HELPERS ========= */
 
 const parsePoint = (p) => {
-  // Accept "lon,lat", [lon,lat], {lon,lat}
   if (typeof p === 'string') {
     const [lon, lat] = p.split(',').map(Number);
     return [lon, lat];
@@ -55,8 +52,7 @@ const parsePoint = (p) => {
 };
 
 const buildCustomModel = (prefs = {}) => {
-  // Penalize big roads/asphalt; keep gravel/ground/dirt at 1; strings for speed limits
-  const mustUseAreas = prefs.must_use_areas || []; // GeoJSON Features with id
+  const mustUseAreas = prefs.must_use_areas || []; // GeoJSON Features with "id"
   return {
     distance_influence: 8,
     priority: [
@@ -67,7 +63,6 @@ const buildCustomModel = (prefs = {}) => {
       { if: 'surface == SAND', multiply_by: '0.25' },
       { if: 'track_type == GRADE4 || track_type == GRADE5', multiply_by: '0.7' },
       { if: 'road_class == PATH || road_class == FOOTWAY || road_class == PEDESTRIAN || road_class == STEPS', multiply_by: '0.01' },
-      // Neutralize motorway/trunk penalties inside "must-use" boxes (e.g., a bridge)
       ...mustUseAreas.map((f) => ({
         if: `in_${f.id} && (road_class == MOTORWAY || road_class == TRUNK)`,
         multiply_by: '1'
@@ -102,21 +97,17 @@ out geom;`;
 
 const ghRoute = async (points, custom_model) => {
   const body = {
-    profile: 'car',                       // moto-like routing
+    profile: 'car',
     points: points.map(([lon, lat]) => [lon, lat]),
     points_encoded: false,
     instructions: false,
     locale: 'en',
     details: ['surface', 'road_class'],
-    'ch.disable': true,                   // required for custom_model
+    'ch.disable': true,
     custom_model
   };
   const url = `https://graphhopper.com/api/1/route?key=${GH_KEY}`;
-  const r = await fetch(url, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify(body)
-  });
+  const r = await fetch(url, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) });
   if (!r.ok) throw new Error(`GraphHopper error: ${await r.text()}`);
   return r.json();
 };
@@ -129,10 +120,10 @@ const toGPX = (name, coords) => `<?xml version="1.0"?>
 </gpx>`;
 
 const uploadToSupabase = async (path, buffer, contentType) => {
-  const { data, error } = await supabase
-    .storage
-    .from(SUPABASE_BUCKET)
-    .upload(path, buffer, { contentType, upsert: true });
+  const { error } = await supabase.storage.from(SUPABASE_BUCKET).upload(path, buffer, {
+    contentType,
+    upsert: true
+  });
   if (error) throw error;
 
   if (SUPABASE_PUBLIC_BUCKET) {
@@ -140,32 +131,29 @@ const uploadToSupabase = async (path, buffer, contentType) => {
     return pub.publicUrl;
   } else {
     const { data: signed, error: signErr } = await supabase
-      .storage
-      .from(SUPABASE_BUCKET)
-      .createSignedUrl(path, 60 * 60 * 24 * 7); // 7 days
+      .storage.from(SUPABASE_BUCKET)
+      .createSignedUrl(path, 60 * 60 * 24 * 7);
     if (signErr) throw signErr;
     return signed.signedUrl;
   }
 };
 
-/* ========= ROUTES ========= */
+/* ========= API ========= */
 
 app.post('/plan', async (req, res) => {
   try {
     const {
       start, end, vias = [],
       region_hint_bbox,
-      must_use_areas = [],   // GeoJSON Features with id
-      prefs = {}             // future: prefer/avoid knobs
+      must_use_areas = [],
+      prefs = {}
     } = req.body;
 
     const pts = [parsePoint(start), ...vias.map(parsePoint), parsePoint(end)];
     const custom = buildCustomModel({ must_use_areas, ...prefs });
 
-    // Optional evidence: candidate tracks (no access filter)
     const tracks = await overpassTracks(region_hint_bbox).catch(() => []);
 
-    // Route with GH
     const gh = await ghRoute(pts, custom);
     const path = gh.paths?.[0];
     if (!path) throw new Error('No route found');
@@ -173,14 +161,12 @@ app.post('/plan', async (req, res) => {
     const coords = path.points.coordinates.map((c) => [c[0], c[1]]);
     const routeId = nanoid();
 
-    // Files
     const gpx = toGPX('ADV Route', coords);
     const gpxUrl = await uploadToSupabase(`routes/${routeId}.gpx`, Buffer.from(gpx), 'application/gpx+xml');
     const geojsonBlob = Buffer.from(JSON.stringify({ type: 'Feature', geometry: path.points, properties: { name: 'ADV Route' } }));
     const geojsonUrl = await uploadToSupabase(`routes/${routeId}.geojson`, geojsonBlob, 'application/geo+json');
 
-    // (Preview page could live at `${PUBLIC_BASE_URL}/v/${routeId}` if you add it later)
-    const response = {
+    res.json({
       routes: [{
         id: routeId,
         name: 'ADV Option 1',
@@ -202,9 +188,7 @@ app.post('/plan', async (req, res) => {
         ...(tracks.slice(0, 5).map(t => ({ type: 'OSM_track', ref: t.id }))),
         { type: 'GH_ok', ref: 'paths[0]' }
       ]
-    };
-
-    res.json(response);
+    });
   } catch (e) {
     console.error(e);
     res.status(500).json({ error: String(e) });
@@ -212,7 +196,6 @@ app.post('/plan', async (req, res) => {
 });
 
 app.post('/refine', async (req, res) => {
-  // MVP: just reuse /plan flow with new body
   req.url = '/plan';
   app._router.handle(req, res, () => {});
 });
