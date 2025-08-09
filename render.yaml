@@ -1,0 +1,30 @@
+services:
+  - type: web
+    name: adv-route
+    env: node
+    plan: free
+    region: frankfurt
+    buildCommand: "npm install"
+    startCommand: "npm start"
+    autoDeploy: true
+    healthCheckPath: /health
+    envVars:
+      - key: PORT
+        value: 8080
+      - key: OVERPASS_URL
+        value: https://overpass-api.de/api/interpreter
+      - key: STORAGE
+        value: SUPABASE
+      # Fill these in the Render dashboard (kept out of repo)
+      - key: PUBLIC_BASE_URL
+        sync: false
+      - key: GH_KEY
+        sync: false
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_SERVICE_ROLE
+        sync: false
+      - key: SUPABASE_BUCKET
+        value: adv-routes
+      - key: SUPABASE_PUBLIC_BUCKET
+        value: "true"
