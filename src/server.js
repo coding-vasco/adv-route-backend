@@ -1,5 +1,7 @@
-// src/server.js — CH + STITCH + geocoding + auto-BBox + rate limiting/backoff
-// Also includes pretty download redirects and a Leaflet preview page.
+// src/server.js — CH + STITCH + geocoding + rate limiting/backoff
+// Patch A: time_budget_h/distance_km_target -> kmTarget + corridor limit
+// Patch B: auto-anchors from Overpass tracks (evenly spaced along axis)
+// Also: pretty download redirects + Leaflet preview page.
 
 import 'dotenv/config';
 import express from 'express';
@@ -24,7 +26,7 @@ need('STORAGE');
 need('SUPABASE_URL');
 need('SUPABASE_SERVICE_ROLE');
 need('SUPABASE_BUCKET');
-need('PUBLIC_BASE_URL', false); // optional, used for pretty links
+need('PUBLIC_BASE_URL', false); // optional, for pretty links
 
 if (process.env.STORAGE !== 'SUPABASE') {
   console.error('[ENV] STORAGE must be SUPABASE for this build.');
@@ -40,36 +42,30 @@ const SUPABASE_PUBLIC_BUCKET =
   String(process.env.SUPABASE_PUBLIC_BUCKET || 'true').toLowerCase() === 'true';
 const PUBLIC_BASE_URL = (process.env.PUBLIC_BASE_URL || '').replace(/\/$/, '');
 
-// Rate limiting knobs (safe defaults for GH free package)
-const GH_MAX_RPS = Math.max(0.5, Number(process.env.GH_MAX_RPS || 2));   // 2 req/s ≈ 120/min
+// GH rate limiting (safe for free plan)
+const GH_MAX_RPS = Math.max(0.5, Number(process.env.GH_MAX_RPS || 2));   // ≈120/min
 const GH_MIN_GAP_MS = Math.max(50, Math.floor(1000 / GH_MAX_RPS));
-const GH_JITTER_MS = Math.max(0, Number(process.env.GH_JITTER_MS || 60)); // small random spread
-const STITCH_MAX_TRACKS = Math.max(1, Number(process.env.STITCH_MAX_TRACKS || 3)); // fewer tracks => fewer connectors
+const GH_JITTER_MS = Math.max(0, Number(process.env.GH_JITTER_MS || 60));
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE, { auth: { persistSession: false } });
 const nanoid = customAlphabet('abcdefghijklmnopqrstuvwxyz0123456789', 12);
 
-/* ========= RATE-LIMITED FETCH (429-aware) ========= */
+/* ========= RATE-LIMITED FETCH ========= */
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 let lastTs = 0;
-
 async function rlFetch(url, opts) {
-  // spacing
   const now = Date.now();
   const wait = Math.max(0, (lastTs + GH_MIN_GAP_MS) - now) + Math.floor(Math.random() * GH_JITTER_MS);
   if (wait) await sleep(wait);
   lastTs = Date.now();
 
   const res = await fetch(url, opts);
-
   if (res.status === 429) {
-    // Honor Retry-After if present; otherwise wait ~1s and retry
     const ra = res.headers.get('retry-after');
     const waitMs = ra ? Math.max(0, Number(ra) * 1000) : 1200;
     await sleep(Math.max(waitMs, 800));
     return rlFetch(url, opts);
   }
-
   return res;
 }
 
@@ -85,75 +81,70 @@ const polylineLenKm = (coords)=> coords.reduce((s,c,i)=> i? s+distKm(coords[i-1]
 const tryParseCommaPair = (s) => {
   const m = String(s).trim().match(/^\s*(-?\d+(\.\d+)?)\s*,\s*(-?\d+(\.\d+)?)\s*$/);
   if (!m) return null;
-  let a = parseFloat(m[1]); // first
-  let b = parseFloat(m[3]); // second
-  // Detect lat,lon vs lon,lat and fix to lon,lat
+  let a = parseFloat(m[1]), b = parseFloat(m[3]);
   const looksLatLon = Math.abs(a) <= 90 && Math.abs(b) <= 180;
   const looksLonLat = Math.abs(a) <= 180 && Math.abs(b) <= 90;
-  if (looksLatLon && !looksLonLat) return [b, a]; // it was lat,lon
-  return [a, b]; // assume lon,lat
+  if (looksLatLon && !looksLonLat) return [b, a];
+  return [a, b];
 };
 
-// Basic in-memory caches (reduce GH calls)
-const geocodeCache = new Map();   // key: text -> [lon,lat]
-const routeCache   = new Map();   // key: "lon1,lat1|lon2,lat2" -> coordinates
+// small caches to reduce calls
+const geocodeCache = new Map();   // text -> [lon,lat]
+const routeCache   = new Map();   // "lon1,lat1|lon2,lat2" -> GH JSON
 
-// GraphHopper Geocoder (rate-limited)
-const geocodeGH = async (text) => {
+// GraphHopper geocoder (RL)
+async function geocodeGH(text) {
   const u = `https://graphhopper.com/api/1/geocode?q=${encodeURIComponent(text)}&limit=1&locale=en&key=${GH_KEY}`;
   const r = await rlFetch(u, { headers: { 'User-Agent': 'adv-route/1.0' }});
   if (!r.ok) throw new Error(`GH geocode HTTP ${r.status}`);
   const j = await r.json();
   const h = j.hits?.[0];
   if (!h?.point) throw new Error('GH geocode: no hits');
-  return { lon: h.point.lng, lat: h.point.lat, provider: 'gh' };
-};
+  return { lon: h.point.lng, lat: h.point.lat };
+}
 
-// Nominatim fallback (not rate-limited)
-const geocodeNominatim = async (text) => {
+// Nominatim fallback
+async function geocodeNominatim(text) {
   const u = `https://nominatim.openstreetmap.org/search?format=jsonv2&limit=1&q=${encodeURIComponent(text)}`;
   const r = await fetch(u, { headers: { 'User-Agent': 'adv-route/1.0' }});
   if (!r.ok) throw new Error(`Nominatim HTTP ${r.status}`);
   const j = await r.json();
   const h = j?.[0];
   if (!h) throw new Error('Nominatim: no hits');
-  return { lon: parseFloat(h.lon), lat: parseFloat(h.lat), provider: 'nominatim' };
-};
+  return { lon: parseFloat(h.lon), lat: parseFloat(h.lat) };
+}
 
-const parsePointOrGeocode = async (input) => {
+async function parsePointOrGeocode(input) {
   if (Array.isArray(input)) return [Number(input[0]), Number(input[1])];
-  if (input && typeof input === 'object' && 'lon' in input && 'lat' in input) {
+  if (input && typeof input === 'object' && 'lon' in input && 'lat' in input)
     return [Number(input.lon), Number(input.lat)];
-  }
+
   const s = String(input).trim();
   const pair = tryParseCommaPair(s);
-  if (pair) return pair; // already lon,lat (or fixed)
+  if (pair) return pair;
 
   if (geocodeCache.has(s)) return geocodeCache.get(s);
   try {
-    const g = await geocodeGH(s);
-    const out = [g.lon, g.lat];
-    geocodeCache.set(s, out);
-    return out;
+    const g = await geocodeGH(s); const out = [g.lon, g.lat];
+    geocodeCache.set(s, out); return out;
   } catch {
-    const g2 = await geocodeNominatim(s);
-    const out = [g2.lon, g2.lat];
-    geocodeCache.set(s, out);
-    return out;
+    const g2 = await geocodeNominatim(s); const out = [g2.lon, g2.lat];
+    geocodeCache.set(s, out); return out;
   }
-};
+}
 
-const autoBBoxFromPoints = (a, b, padKm = 25) => {
+// bbox from two points with custom padding (km)
+function bboxFromTwoPoints(a, b, padKm) {
   const minLat = Math.min(a[1], b[1]), maxLat = Math.max(a[1], b[1]);
   const minLon = Math.min(a[0], b[0]), maxLon = Math.max(a[0], b[0]);
   const latPad = padKm / 111;
   const midLat = (a[1] + b[1]) / 2;
   const lonPad = padKm / (111 * Math.cos(toRad(midLat)) || 1);
   return [minLat - latPad, minLon - lonPad, maxLat + latPad, maxLon + lonPad]; // [S,W,N,E]
-};
+}
 
 /* ========= Overpass, GH CH, Supabase ========= */
-const overpassTracks = async (bbox) => {
+async function overpassTracks(bbox) {
   if (!bbox) return [];
   const [south, west, north, east] = bbox;
   const q = `
@@ -170,10 +161,9 @@ out geom;`;
     id: String(w.id),
     coords: (w.geometry || []).map((g) => [g.lon, g.lat])
   }));
-};
+}
 
 async function ghRouteCH(points, profile = 'car') {
-  // cache only for 2-point connectors
   let cacheKey = null;
   if (points.length === 2) {
     const a = points[0], b = points[1];
@@ -192,6 +182,7 @@ async function ghRouteCH(points, profile = 'car') {
   return j;
 }
 
+/* ========= Files ========= */
 const toGPX = (name, coords) => `<?xml version="1.0"?>
 <gpx version="1.1" creator="adv-route" xmlns="http://www.topografix.com/GPX/1/1">
   <trk><name>${name}</name><trkseg>${
@@ -199,7 +190,7 @@ const toGPX = (name, coords) => `<?xml version="1.0"?>
   }</trkseg></trk>
 </gpx>`;
 
-const uploadToSupabase = async (path, buffer, contentType) => {
+async function uploadToSupabase(path, buffer, contentType) {
   const { error } = await supabase.storage.from(SUPABASE_BUCKET).upload(path, buffer, { contentType, upsert: true });
   if (error) throw error;
   if (SUPABASE_PUBLIC_BUCKET) {
@@ -210,9 +201,7 @@ const uploadToSupabase = async (path, buffer, contentType) => {
     if (signErr) throw signErr;
     return signed.signedUrl;
   }
-};
-
-// Helper for pretty links when using a private bucket
+}
 async function storageUrlFor(path) {
   if (SUPABASE_PUBLIC_BUCKET) {
     const { data } = supabase.storage.from(SUPABASE_BUCKET).getPublicUrl(path);
@@ -231,7 +220,8 @@ const project01 = (p,a,b)=>{
   const vx=bx-ax, vy=by-ay, wx=px-ax, wy=py-ay;
   const vv=vx*vx+vy*vy || 1e-9; const t=(vx*wx+vy*wy)/vv; return Math.max(0,Math.min(1,t));
 };
-function selectTracksAlongAxis(tracks, start, end, {max=STITCH_MAX_TRACKS, maxAxisKm=6}) {
+
+function selectTracksAlongAxis(tracks, start, end, {max=3, maxAxisKm=6}) {
   const scored = tracks.map(w=>{
     if (!w.coords?.length) return null;
     const mid = w.coords[Math.floor(w.coords.length/2)];
@@ -241,7 +231,8 @@ function selectTracksAlongAxis(tracks, start, end, {max=STITCH_MAX_TRACKS, maxAx
     const len = polylineLenKm(w.coords);
     return { id:w.id, coords:w.coords, t, off, len };
   }).filter(Boolean).filter(x=>x.off<=maxAxisKm);
-  const out=[]; const minGap=0.12;
+
+  const out=[]; const minGap=0.12; // keep anchors spaced
   for (const cand of scored.sort((a,b)=>b.len-a.len)) {
     if (out.find(o=>Math.abs(o.t-cand.t)<minGap)) continue;
     out.push(cand);
@@ -250,12 +241,15 @@ function selectTracksAlongAxis(tracks, start, end, {max=STITCH_MAX_TRACKS, maxAx
   return out.sort((a,b)=>a.t-b.t);
 }
 
-async function buildStitchedRoute(start, end, vias, tracks){
-  const selected = selectTracksAlongAxis(tracks, start, end, {max:STITCH_MAX_TRACKS, maxAxisKm:6});
-  const anchors = [start, ...vias, ...selected.map(s=>s.coords[0]), end];
+async function buildStitchedRoute(start, end, vias, tracks, dynMaxTracks, axisKm) {
+  const selected = selectTracksAlongAxis(tracks, start, end, {max: dynMaxTracks, maxAxisKm: axisKm});
+  // Auto-anchors: track starts, evenly spaced along axis
+  const autoAnchors = selected.map(s=>s.coords[0]);
+  const anchors = [start, ...vias, ...autoAnchors, end];
+
+  // CH connectors between anchors
   const segments = [];
   let last = anchors[0];
-
   for (let i=1;i<anchors.length;i++){
     const next = anchors[i];
     const gh = await ghRouteCH([last, next], 'car');
@@ -264,25 +258,40 @@ async function buildStitchedRoute(start, end, vias, tracks){
     last = next;
   }
 
+  // Insert track polylines after their nearest connector
   const merged=[]; let selIdx=0;
   for (const seg of segments){
     merged.push(seg);
     const track = selected[selIdx];
     const endPt = seg.coords[seg.coords.length-1];
-    if (track && distKm(endPt, track.coords[0]) < 0.15) { merged.push({type:'track', id:track.id, coords:track.coords}); selIdx++; }
+    if (track && distKm(endPt, track.coords[0]) < 0.15) {
+      merged.push({type:'track', id:track.id, coords:track.coords});
+      selIdx++;
+    }
   }
 
   const all=[];
   for (const s of merged){ if (all.length) all.pop(); all.push(...s.coords); }
-  const evidence = selected.map(s=>({type:'OSM_track', ref:s.id, km:+s.len.toFixed(2)}));
-  return { coords: all, evidence };
+  const evidence = selected.map(s=>({type:'OSM_track', ref:s.id, km:+polylineLenKm(s.coords).toFixed(2)}));
+  return { coords: all, evidence, autoAnchors };
 }
 
 /* ========= API ========= */
 
 app.post('/plan', async (req, res) => {
   try {
-    const { start, end, vias = [], region_hint_bbox, strategy = 'stitch' } = req.body;
+    const {
+      start, end,
+      vias = [],
+      region_hint_bbox,
+      strategy = 'stitch',
+      // NEW knobs (optional)
+      time_budget_h,
+      distance_km_target,
+      off_pavement_target,
+      loop
+    } = req.body;
+
     if (!start || !end) return res.status(400).json({ error: 'start and end are required (address/place or lon,lat)' });
 
     // Geocode/parse
@@ -291,23 +300,40 @@ app.post('/plan', async (req, res) => {
     const viaPts = [];
     for (const v of vias) viaPts.push(await parsePointOrGeocode(v));
 
-    // BBox: provided or auto
+    // ------- Patch A: km target + corridor pad -------
+    const off = Math.max(0, Math.min(0.9, Number(off_pavement_target ?? 0.3)));
+    const avgSpeedKmh = (1 - off) * 50 + off * 30; // rough paved/offroad blend
+    const kmTarget = Number(distance_km_target) > 0
+      ? Number(distance_km_target)
+      : (Number(time_budget_h) > 0 ? Math.max(15, Math.min(400, Number(time_budget_h) * avgSpeedKmh)) : 80);
+
+    // corridor padding (km): tighter for short trips, wider for long
+    const padKm = Math.max(8, Math.min(35, (loop ? kmTarget/3 : kmTarget/2)));
     const bbox = Array.isArray(region_hint_bbox) && region_hint_bbox.length===4
       ? region_hint_bbox.map(Number)
-      : autoBBoxFromPoints(a, b, 25);
+      : bboxFromTwoPoints(a, b, padKm);
 
-    // Overpass discovery (evidence + stitch input)
+    // ------- Overpass discovery (tracks) -------
     const tracks = await overpassTracks(bbox).catch(() => []);
+
+    // Dynamic limits tied to kmTarget
+    const dynMaxTracks =
+      kmTarget <= 60 ? 1 :
+      kmTarget <= 120 ? 2 :
+      kmTarget <= 180 ? 3 : 4;
+
+    const axisKm = Math.max(4, Math.min(8, kmTarget / 25)); // allowable lateral offset from axis
 
     let coords, note; const evidence = [{ type:'GH_mode', ref:'CH' }];
 
     if (strategy === 'stitch') {
-      const built = await buildStitchedRoute(a, b, viaPts, tracks);
+      // ------- Patch B: auto-anchors from Overpass -------
+      const built = await buildStitchedRoute(a, b, viaPts, tracks, dynMaxTracks, axisKm);
       coords = built.coords;
       evidence.push(...built.evidence);
-      note = 'STITCH mode: CH connectors + OSM tracks (no Custom Model).';
+      if (built.autoAnchors?.length) evidence.push({ type:'auto_anchors', ref: String(built.autoAnchors.length) });
+      note = `STITCH mode: CH connectors + OSM tracks. Corridor ~${padKm.toFixed(0)}km pad, kmTarget≈${kmTarget.toFixed(0)}.`;
     } else {
-      // Plain CH route (keep #locations <= free plan limit when using free plan)
       const gh = await ghRouteCH([a, ...viaPts, b], 'car');
       coords = gh.paths[0].points.coordinates.map(c=>[c[0],c[1]]);
       note = 'CH mode: standard routing (free plan).';
@@ -337,7 +363,9 @@ app.post('/plan', async (req, res) => {
         pretty_gpx_url: prettyGpx,
         pretty_geojson_url: prettyGeo,
         custom_model_used: null,
-        via_points_used: [a, ...viaPts, b]
+        via_points_used: [a, ...viaPts, b],
+        km_target_used: +kmTarget.toFixed(1),
+        corridor_pad_km: +padKm.toFixed(1)
       }],
       evidence
     });
@@ -430,4 +458,6 @@ app.post('/refine', async (req, res) => { req.url = '/plan'; app._router.handle(
 app.get('/health', (_, res) => res.json({ ok: true }));
 
 const PORT = process.env.PORT || 8080;
-app.listen(PORT, () => console.log(`ADV backend on :${PORT} | GH_MAX_RPS=${GH_MAX_RPS}, STITCH_MAX_TRACKS=${STITCH_MAX_TRACKS}`));
+app.listen(PORT, () =>
+  console.log(`ADV backend on :${PORT} | GH_MAX_RPS=${GH_MAX_RPS}`)
+);
