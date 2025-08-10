@@ -1,4 +1,4 @@
-// Adds optional avoid_motorways, prefer_surfaces, avoid_surfaces to plan schema.
+// Adds optional custom model flags and surface prefs to plan schema.
 import { z } from 'zod';
 
 const coord = z.union([
@@ -6,6 +6,9 @@ const coord = z.union([
   z.string(),
   z.object({ lon: z.number(), lat: z.number() })
 ]);
+
+const surfacePreferEnum = z.enum(['asphalt','compacted','gravel','dirt','ground','fine_gravel','sand']);
+const surfaceEnum = z.enum(['asphalt','compacted','gravel','dirt','ground','fine_gravel','sand','mud']);
 
 export const planSchema = z.object({
   start: coord,
@@ -15,9 +18,11 @@ export const planSchema = z.object({
   time_budget_h: z.number().positive().optional(),
   region_hint_bbox: z.array(z.number()).length(4).optional(),
   strategy: z.enum(['ch','stitch']).optional(),
+  use_custom_model: z.boolean().optional(),
   avoid_motorways: z.boolean().optional(),
-  prefer_surfaces: z.array(z.enum(['asphalt','compacted','gravel','dirt','sand','fine_gravel','ground','earth','mud'])).optional(),
-  avoid_surfaces: z.array(z.enum(['asphalt','compacted','gravel','dirt','sand','fine_gravel','ground','earth','mud'])).optional()
+  avoid_tolls: z.boolean().optional(),
+  prefer_surfaces: z.array(surfacePreferEnum).optional(),
+  avoid_surfaces: z.array(surfaceEnum).optional()
 });
 
 export function validatePlan(body) {
