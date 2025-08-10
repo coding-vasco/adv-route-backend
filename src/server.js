@@ -250,7 +250,67 @@ out geom;`;
   return anchors;
 }
 
-async function ghRouteCH(points, profile = 'car') {
+function buildCustomModel({ avoid_motorways, avoid_tolls, prefer_surfaces = [], avoid_surfaces = [] } = {}) {
+  const model = {
+    priority: [
+      { if: 'road_class == MOTORWAY || road_class == TRUNK', multiply_by: 0.1 },
+      { if: 'road_class == PRIMARY', multiply_by: 0.5 },
+      { if: 'surface == ASPHALT', multiply_by: 0.85 },
+      { if: 'surface == SAND || surface == MUD', multiply_by: 0.15 },
+      { if: 'track_type == GRADE4 || track_type == GRADE5', multiply_by: 0.5 },
+      { if: 'smoothness == VERY_BAD || smoothness == HORRIBLE || smoothness == VERY_HORRIBLE || smoothness == IMPASSABLE', multiply_by: 0.5 }
+    ],
+    speed: [
+      { if: 'road_class == MOTORWAY || road_class == TRUNK', limit_to: '70 km/h' },
+      { if: 'road_class == PRIMARY', limit_to: '60 km/h' },
+      { if: 'surface == SAND || surface == MUD', limit_to: '25 km/h' }
+    ],
+    distance_influence: 70
+  };
+
+  if (avoid_motorways) {
+    const r = model.priority.find(x => x.if === 'road_class == MOTORWAY || road_class == TRUNK');
+    if (r) r.multiply_by = 0.05;
+  }
+
+  if (avoid_tolls) {
+    model.priority.push({ if: 'road_environment == TOLL', multiply_by: 0.1 });
+  }
+
+  const pref = new Set(prefer_surfaces);
+  if (pref.has('asphalt')) {
+    const idx = model.priority.findIndex(r => r.if === 'surface == ASPHALT');
+    if (idx >= 0) model.priority.splice(idx, 1);
+  }
+  if (pref.has('sand')) {
+    const idx = model.priority.findIndex(r => r.if === 'surface == SAND || surface == MUD');
+    if (idx >= 0) model.priority[idx].if = 'surface == MUD';
+    const sIdx = model.speed.findIndex(r => r.if === 'surface == SAND || surface == MUD');
+    if (sIdx >= 0) model.speed[sIdx].if = 'surface == MUD';
+  }
+
+  const avoid = new Set(avoid_surfaces);
+  if (avoid.has('asphalt')) {
+    const r = model.priority.find(x => x.if === 'surface == ASPHALT');
+    if (r) r.multiply_by = 0.4; else model.priority.push({ if: 'surface == ASPHALT', multiply_by: 0.4 });
+  }
+  if (avoid.has('sand')) {
+    const r = model.priority.find(x => x.if.includes('SAND'));
+    if (r) r.multiply_by = 0.1; else model.priority.push({ if: 'surface == SAND', multiply_by: 0.1 });
+  }
+  if (avoid.has('mud')) {
+    const r = model.priority.find(x => x.if.includes('MUD'));
+    if (r) r.multiply_by = 0.1; else model.priority.push({ if: 'surface == MUD', multiply_by: 0.1 });
+  }
+  for (const s of avoid) {
+    if (['asphalt','sand','mud'].includes(s)) continue;
+    model.priority.push({ if: `surface == ${s.toUpperCase()}`, multiply_by: 0.4 });
+  }
+
+  return model;
+}
+
+async function ghRoute(points, { mode = 'ch', customModel } = {}) {
   let pts = collapseNearDuplicates(points, 30);
   if (pts.length >= 2 && sameCoordinate(pts[0], pts[pts.length - 1], 10)) {
     pts[pts.length - 1] = jitterPoint(pts[pts.length - 1], 11);
@@ -260,16 +320,21 @@ async function ghRouteCH(points, profile = 'car') {
     const a = pts[0], b = pts[1];
     const keyA = `${a[0].toFixed(5)},${a[1].toFixed(5)}`;
     const keyB = `${b[0].toFixed(5)},${b[1].toFixed(5)}`;
-    cacheKey = `${keyA}|${keyB}`;
+    const modelKey = mode === 'flex' ? JSON.stringify(customModel || {}) : '';
+    cacheKey = `${mode}|${modelKey}|${keyA}|${keyB}`;
     if (routeCache.has(cacheKey)) return routeCache.get(cacheKey);
   }
   const body = {
-    profile,
+    profile: 'car',
     points: pts.map(p => [p[0], p[1]]),
     points_encoded: false,
     locale: 'en',
     instructions: false
   };
+  if (mode === 'flex') {
+    body.ch = { disable: true };
+    if (customModel) body.custom_model = customModel;
+  }
   const url = `https://graphhopper.com/api/1/route?key=${GH_KEY}`;
   const r = await rlFetch(url, {
     method: 'POST',
@@ -278,7 +343,6 @@ async function ghRouteCH(points, profile = 'car') {
   });
 
   if (!r.ok) {
-    // Bubble up GH error text (kept & hardened)
     let msg = `GH route HTTP ${r.status}`;
     try {
       const txt = await r.text();
@@ -324,20 +388,33 @@ async function storageUrlFor(path) {
 }
 
 /* ========= Helpers ========= */
-async function buildCHOnlyRoute(a, b, viaPts, log) {
+async function buildCHOnlyRoute(a, b, viaPts, log, { customModel } = {}) {
   const points = collapseNearDuplicates([a, ...viaPts, b], 30);
   if (points.length >= 2 && sameCoordinate(points[0], points[points.length - 1], 10)) {
-    // tiny jitter to avoid CH "same point" quirks in loops
     points[points.length - 1] = jitterPoint(points[points.length - 1], 11);
   }
-  const gh = await ghRouteCH(points, 'car');
-  const coords = gh.paths[0].points.coordinates.map(c=>[c[0],c[1]]);
-  log?.info({ pts: points.length, km: +polylineLenKm(coords).toFixed(1) }, 'CH-only route built');
-  return { coords, evidence: [{ type:'GH_mode', ref:'CH' }], autoAnchors: [] };
+  const mode = customModel ? 'flex' : 'ch';
+  try {
+    const gh = await ghRoute(points, { mode, customModel });
+    const coords = gh.paths[0].points.coordinates.map(c => [c[0], c[1]]);
+    log?.info({ pts: points.length, km: +polylineLenKm(coords).toFixed(1) }, `${mode.toUpperCase()} route built`);
+    const ev = [{ type: 'GH_mode', ref: mode === 'flex' ? 'FLEX' : 'CH' }];
+    if (customModel) ev.push({ type: 'custom_model', ref: 'used' });
+    return { coords, evidence: ev, autoAnchors: [] };
+  } catch (err) {
+    if (mode === 'flex') {
+      log?.error({ err: String(err) }, 'flex route failed; falling back to CH');
+      const gh = await ghRoute(points, { mode: 'ch' });
+      const coords = gh.paths[0].points.coordinates.map(c => [c[0], c[1]]);
+      const ev = [{ type: 'GH_mode', ref: 'CH' }, { type: 'custom_model', ref: 'fallback' }];
+      return { coords, evidence: ev, autoAnchors: [] };
+    }
+    throw err;
+  }
 }
 
 /* ========= Stitch builder ========= */
-async function buildStitchedRoute(start, end, vias, tracks, dynMaxTracks, axisKm, parentLog) {
+async function buildStitchedRoute(start, end, vias, tracks, dynMaxTracks, axisKm, parentLog, { customModel } = {}) {
   const requestId = nanoid();
   const log = (parentLog || logger).child({ requestId });
 
@@ -357,12 +434,12 @@ async function buildStitchedRoute(start, end, vias, tracks, dynMaxTracks, axisKm
 
   if (anchors.length < 2) {
     log.warn({ count: anchors.length }, 'anchors insufficient; falling back to CH-only');
-    const ch = await buildCHOnlyRoute(start, end, vias, log);
+    const ch = await buildCHOnlyRoute(start, end, vias, log, { customModel });
     ch.evidence = ch.evidence.concat([{ type:'auto_anchors', ref:'0' }]);
     return ch;
   }
 
-  // --- build CH connectors with rich logging ---
+  // --- build connectors with rich logging ---
   const segments = [];
   let last = anchors[0];
 
@@ -373,39 +450,52 @@ async function buildStitchedRoute(start, end, vias, tracks, dynMaxTracks, axisKm
       log.warn({ i, from: fmtPt(last), to: fmtPt(next), hopKm }, 'stitch: skip tiny connector');
       continue;
     }
-    // collapse consecutive near-duplicates to keep GH happy
     const pair = collapseNearDuplicates([last, next], 30);
     if (pair.length < 2) continue;
     try {
-      const ghSeg = await ghRouteCH(pair, 'car');
+      const ghSeg = await ghRoute(pair, { mode: customModel ? 'flex' : 'ch', customModel });
       const segCoords = ghSeg.paths[0].points.coordinates.map(c=>[c[0],c[1]]);
       const segKm = polylineLenKm(segCoords);
       log.info({ i, from: fmtPt(last), to: fmtPt(next), segKm }, 'stitch: connector');
       segments.push({ type:'connector', coords: segCoords });
       last = next;
     } catch (err) {
-      log.error({ i, from: fmtPt(last), to: fmtPt(next), err: String(err) }, 'stitch: connector failed');
-      // try to salvage by skipping this anchor once
+      if (customModel) {
+        log.warn({ i, from: fmtPt(last), to: fmtPt(next), err: String(err) }, 'stitch: flex connector failed; retry CH');
+        try {
+          const ghSeg = await ghRoute(pair, { mode: 'ch' });
+          const segCoords = ghSeg.paths[0].points.coordinates.map(c=>[c[0],c[1]]);
+          const segKm = polylineLenKm(segCoords);
+          log.warn({ i, from: fmtPt(last), to: fmtPt(next), segKm }, 'stitch: connector downgraded to CH');
+          segments.push({ type:'connector', coords: segCoords });
+          last = next;
+          continue;
+        } catch (err2) {
+          log.error({ i, from: fmtPt(last), to: fmtPt(next), err: String(err2) }, 'stitch: connector failed after downgrade');
+        }
+      } else {
+        log.error({ i, from: fmtPt(last), to: fmtPt(next), err: String(err) }, 'stitch: connector failed');
+      }
       if (i + 1 < anchors.length) {
         const skipTo = anchors[i + 1];
         try {
-          const ghSeg2 = await ghRouteCH(collapseNearDuplicates([last, skipTo], 30), 'car');
+          const ghSeg2 = await ghRoute(collapseNearDuplicates([last, skipTo], 30), { mode: customModel ? 'flex' : 'ch', customModel });
           const segCoords2 = ghSeg2.paths[0].points.coordinates.map(c=>[c[0],c[1]]);
           const segKm2 = polylineLenKm(segCoords2);
           log.warn({ i, skippedTo: fmtPt(skipTo), segKm2 }, 'stitch: recovered by skipping one anchor');
           segments.push({ type:'connector', coords: segCoords2 });
           last = skipTo;
-          i++; // skip one anchor
+          i++;
           continue;
         } catch (err2) {
           log.error({ i, err2: String(err2) }, 'stitch: recovery failed; falling back to CH-only');
-          const ch = await buildCHOnlyRoute(start, end, vias, log);
+          const ch = await buildCHOnlyRoute(start, end, vias, log, { customModel });
           ch.evidence = ch.evidence.concat([{ type:'auto_anchors', ref:'0' }]);
           return ch;
         }
       } else {
         log.error({ i }, 'stitch: last connector failed; falling back to CH-only');
-        const ch = await buildCHOnlyRoute(start, end, vias, log);
+        const ch = await buildCHOnlyRoute(start, end, vias, log, { customModel });
         ch.evidence = ch.evidence.concat([{ type:'auto_anchors', ref:'0' }]);
         return ch;
       }
@@ -414,7 +504,7 @@ async function buildStitchedRoute(start, end, vias, tracks, dynMaxTracks, axisKm
 
   if (!segments.length) {
     log.warn('stitch: no connectors built; falling back to CH-only');
-    const ch = await buildCHOnlyRoute(start, end, vias, log);
+    const ch = await buildCHOnlyRoute(start, end, vias, log, { customModel });
     ch.evidence = ch.evidence.concat([{ type:'auto_anchors', ref:'0' }]);
     return ch;
   }
@@ -444,12 +534,13 @@ async function buildStitchedRoute(start, end, vias, tracks, dynMaxTracks, axisKm
   }
 
   const evidence = [{ type:'GH_mode', ref:'STITCH' }];
+  if (customModel) evidence.push({ type: 'custom_model', ref: 'used' });
   if (autoAnchors.length) {
     evidence.push({ type:'auto_anchors', ref:String(autoAnchors.length) });
     return { coords, evidence, autoAnchors };
   }
   log.warn('stitch: no tracks attached; falling back to CH-only');
-  const ch = await buildCHOnlyRoute(start, end, vias, log);
+  const ch = await buildCHOnlyRoute(start, end, vias, log, { customModel });
   ch.evidence = ch.evidence.concat([{ type:'auto_anchors', ref:'0' }]);
   return ch;
 }
@@ -469,7 +560,9 @@ app.post('/plan', async (req, res) => {
       strategy = 'ch',
       off_pavement_target,
       loop,
+      use_custom_model,
       avoid_motorways,
+      avoid_tolls,
       prefer_surfaces,
       avoid_surfaces
     } = validatePlan(req.body);
@@ -495,9 +588,7 @@ app.post('/plan', async (req, res) => {
     if (Array.isArray(region_hint_bbox) && region_hint_bbox.length === 4) {
       const userBbox = region_hint_bbox.map(Number);
       const userArea = bboxAreaKm2(userBbox);
-      if (userArea <= areaKm2 && userArea <= BBOX_AREA_MAX_KM2) {
-        bbox = userBbox;
-      } else {
+@@ -501,95 +594,107 @@ app.post('/plan', async (req, res) => {
         log.info({ clamped: true, userArea }, 'supplied bbox too large');
       }
     }
@@ -523,28 +614,40 @@ app.post('/plan', async (req, res) => {
 
     const axisKm = Math.max(4, Math.min(8, kmTarget / 25));
 
+    const wantCustom = use_custom_model === true || avoid_motorways === true || avoid_tolls === true ||
+      (Array.isArray(prefer_surfaces) && prefer_surfaces.length) ||
+      (Array.isArray(avoid_surfaces) && avoid_surfaces.length);
+    const customModel = wantCustom ? buildCustomModel({ avoid_motorways, avoid_tolls, prefer_surfaces, avoid_surfaces }) : null;
+    if (customModel) {
+      log.info({ custom_model_priority: customModel.priority.length, custom_model_speed: customModel.speed.length }, 'custom model');
+    }
+
     let coords, note;
     let evidence = [];
 
     if (strategy === 'stitch') {
       try {
-        const built = await buildStitchedRoute(a, b, viaPts, tracks, dynMaxTracks, axisKm, log);
+        const built = await buildStitchedRoute(a, b, viaPts, tracks, dynMaxTracks, axisKm, log, { customModel });
         coords = built.coords;
         evidence = built.evidence;
         note = `STITCH mode: CH connectors + OSM tracks. Corridor ~${padKm.toFixed(0)}km pad, kmTarget≈${kmTarget.toFixed(0)}.`;
       } catch (err) {
         log.error({ err: String(err) }, 'stitch failed; falling back to CH-only');
-        const built = await buildCHOnlyRoute(a, b, viaPts, log);
+        const built = await buildCHOnlyRoute(a, b, viaPts, log, { customModel });
         coords = built.coords;
         evidence = built.evidence.concat([{ type:'auto_anchors', ref:'0' }]);
         note = `CH fallback: connectors only. Corridor ~${padKm.toFixed(0)}km pad, kmTarget≈${kmTarget.toFixed(0)}.`;
       }
     } else {
-      const built = await buildCHOnlyRoute(a, b, viaPts, log);
+      const built = await buildCHOnlyRoute(a, b, viaPts, log, { customModel });
       coords = built.coords;
       evidence = built.evidence;
       note = 'CH mode: standard routing (free plan).';
     }
+
+    const customModelUsed = customModel ? (evidence.find(e => e.type === 'custom_model' && e.ref === 'fallback') ? 'fallback' : 'used') : null;
+    const ghMode = customModel && customModelUsed !== 'fallback' ? 'flex' : 'ch';
+    log.info({ gh_mode: ghMode }, 'routing mode');
 
     const routeId = nanoid();
     const gpx = toGPX('ADV Route', coords);
@@ -567,7 +670,7 @@ app.post('/plan', async (req, res) => {
         preview_url: previewUrl,
         pretty_gpx_url: prettyGpx,
         pretty_geojson_url: prettyGeo,
-        custom_model_used: null,
+        custom_model_used: customModelUsed,
         via_points_used: [a, ...viaPts, b],
         km_target_used: +kmTarget.toFixed(1),
         corridor_pad_km: +padKm.toFixed(1)
@@ -593,7 +696,7 @@ app.get('/download/route/:id.:ext', async (req, res) => {
   } catch (e) {
     console.error(e);
     res.status(500).send('server error');
-  }
+    }
 });
 
 app.get('/v/:id', async (req, res) => {
