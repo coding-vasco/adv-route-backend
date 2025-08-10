@@ -39,7 +39,7 @@ if (process.env.STORAGE !== 'SUPABASE') {
 const GH_KEY = process.env.GH_KEY;
 const OVERPASS_URL = process.env.OVERPASS_URL;
 const SUPABASE_URL = process.env.SUPABASE_URL;
-the SUPABASE_SERVICE_ROLE = process.env.SUPABASE_SERVICE_ROLE;
+const SUPABASE_SERVICE_ROLE = process.env.SUPABASE_SERVICE_ROLE;
 const SUPABASE_BUCKET = process.env.SUPABASE_BUCKET;
 const SUPABASE_PUBLIC_BUCKET =
   String(process.env.SUPABASE_PUBLIC_BUCKET || 'true').toLowerCase() === 'true';
