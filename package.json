@@ -5,6 +5,8 @@
   "scripts": {
     "start": "node src/server.js",
     "dev": "node --watch src/server.js"
+    "dev": "node --watch src/server.js",
+    "test": "vitest"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.45.4",
@@ -12,5 +14,13 @@
     "express": "^4.19.2",
     "nanoid": "^5.0.7",
     "node-fetch": "^3.3.2"
+    "pino": "^9.1.0",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "vitest": "^1.6.0"
+  },
+  "engines": {
+    "node": ">=20"
   }
 }
