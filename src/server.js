@@ -258,6 +258,8 @@ async function buildStitchedRoute(start, end, vias, tracks, dynMaxTracks, axisKm
 
 /* ========= ROUTE PLANNING ========= */
 app.post('/plan', async (req, res) => {
+  const requestId = nanoid();
+  const log = logger.child({ requestId });
   try {
     const {
       start,
