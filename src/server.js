@@ -589,7 +589,9 @@ app.post('/plan', async (req, res) => {
     if (Array.isArray(region_hint_bbox) && region_hint_bbox.length === 4) {
       const userBbox = region_hint_bbox.map(Number);
       const userArea = bboxAreaKm2(userBbox);
-@@ -501,95 +595,113 @@ app.post('/plan', async (req, res) => {
+    }
+    
+app.post('/plan', async (req, res) => {
         log.info({ clamped: true, userArea }, 'supplied bbox too large');
       }
     }
