@@ -4,6 +4,7 @@
 // Patch A' (this commit): rich connector logging + bubble up GH error text
 // Patch B' (this commit): guard badly-formed anchors & tiny segments + cleaning summary
 // Patch C (this commit): JOIN_RADIUS_M, de-dup & loop jitter, CH fallback when stitching fails
+// Patch D (this commit): minor-road anchors, extended dirt surfaces, STITCH_MAX_TRACKS env, motorway bias logging
 // Also: pretty download redirects + Leaflet preview page.
 
 import 'dotenv/config';
@@ -60,6 +61,7 @@ const GH_JITTER_MS = Math.max(0, Number(process.env.GH_JITTER_MS || 60));
 // Join/attach thresholds
 const JOIN_RADIUS_M = parseInt(process.env.JOIN_RADIUS_M || '300', 10); // default 300 m
 const JOIN_RADIUS_KM = Math.max(0.05, JOIN_RADIUS_M / 1000);            // never below 50 m
+const STITCH_MAX_TRACKS = parseInt(process.env.STITCH_MAX_TRACKS || '0', 10); // 0 = no hard cap
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE, { auth: { persistSession: false } });
 const nanoid = customAlphabet('abcdefghijklmnopqrstuvwxyz0123456789', 12);
@@ -189,7 +191,7 @@ async function overpassTracks(bbox) {
 [out:json][timeout:60];
 way["highway"="track"]
   (${south},${west},${north},${east})
-  ["surface"~"gravel|compacted|fine_gravel|ground|dirt"]
+  ["surface"~"gravel|compacted|fine_gravel|ground|earth|mud|pebblestone|unpaved"]
   ["tracktype"~"grade1|grade2|grade3"];
 out geom;`;
   const r = await fetch(OVERPASS_URL, { method: 'POST', body: q });
@@ -201,10 +203,61 @@ out geom;`;
   }));
 }
 
+async function minorRoadAnchors(bbox, axisLine, n = 4) {
+  if (!bbox || !Array.isArray(axisLine) || axisLine.length < 2) return [];
+  const [south, west, north, east] = bbox;
+  const q = `
+[out:json][timeout:60];
+way["highway"~"tertiary|unclassified|residential|service|track"][!"motorway"][!"trunk"][!"primary"]
+  (${south},${west},${north},${east});
+out geom;`;
+  const r = await fetch(OVERPASS_URL, { method: 'POST', body: q });
+  if (!r.ok) throw new Error(`Overpass error: ${await r.text()}`);
+  const j = await r.json();
+  const pts = [];
+  for (const w of j.elements || []) {
+    for (const g of w.geometry || []) pts.push([g.lon, g.lat]);
+  }
+  if (!pts.length) return [];
+  const count = Math.max(3, Math.min(6, n));
+  const samples = [];
+  const total = polylineLenKm(axisLine);
+  if (total <= 0) return [];
+  const step = total / (count + 1);
+  let distAcc = 0, target = step;
+  for (let i = 1; i < axisLine.length && samples.length < count; i++) {
+    const a = axisLine[i - 1], b = axisLine[i];
+    const seg = distKm(a, b);
+    while (distAcc + seg >= target && samples.length < count) {
+      const ratio = (target - distAcc) / seg;
+      const sx = a[0] + (b[0] - a[0]) * ratio;
+      const sy = a[1] + (b[1] - a[1]) * ratio;
+      samples.push([sx, sy]);
+      target += step;
+    }
+    distAcc += seg;
+  }
+  const anchors = [];
+  for (const s of samples) {
+    let best = pts[0];
+    let bestD = distKm(s, best);
+    for (const p of pts) {
+      const d = distKm(s, p);
+      if (d < bestD) { bestD = d; best = p; }
+    }
+    anchors.push(best);
+  }
+  return anchors;
+}
+
 async function ghRouteCH(points, profile = 'car') {
+  let pts = collapseNearDuplicates(points, 30);
+  if (pts.length >= 2 && sameCoordinate(pts[0], pts[pts.length - 1], 10)) {
+    pts[pts.length - 1] = jitterPoint(pts[pts.length - 1], 11);
+  }
   let cacheKey = null;
-  if (points.length === 2) {
-    const a = points[0], b = points[1];
+  if (pts.length === 2) {
+    const a = pts[0], b = pts[1];
     const keyA = `${a[0].toFixed(5)},${a[1].toFixed(5)}`;
     const keyB = `${b[0].toFixed(5)},${b[1].toFixed(5)}`;
     cacheKey = `${keyA}|${keyB}`;
@@ -212,7 +265,7 @@ async function ghRouteCH(points, profile = 'car') {
   }
   const body = {
     profile,
-    points: points.map(p => [p[0], p[1]]),
+    points: pts.map(p => [p[0], p[1]]),
     points_encoded: false,
     locale: 'en',
     instructions: false
@@ -304,7 +357,9 @@ async function buildStitchedRoute(start, end, vias, tracks, dynMaxTracks, axisKm
 
   if (anchors.length < 2) {
     log.warn({ count: anchors.length }, 'anchors insufficient; falling back to CH-only');
-    return buildCHOnlyRoute(start, end, vias, log);
+    const ch = await buildCHOnlyRoute(start, end, vias, log);
+    ch.evidence = ch.evidence.concat([{ type:'auto_anchors', ref:'0' }]);
+    return ch;
   }
 
   // --- build CH connectors with rich logging ---
@@ -344,18 +399,24 @@ async function buildStitchedRoute(start, end, vias, tracks, dynMaxTracks, axisKm
           continue;
         } catch (err2) {
           log.error({ i, err2: String(err2) }, 'stitch: recovery failed; falling back to CH-only');
-          return buildCHOnlyRoute(start, end, vias, log);
+          const ch = await buildCHOnlyRoute(start, end, vias, log);
+          ch.evidence = ch.evidence.concat([{ type:'auto_anchors', ref:'0' }]);
+          return ch;
         }
       } else {
         log.error({ i }, 'stitch: last connector failed; falling back to CH-only');
-        return buildCHOnlyRoute(start, end, vias, log);
+        const ch = await buildCHOnlyRoute(start, end, vias, log);
+        ch.evidence = ch.evidence.concat([{ type:'auto_anchors', ref:'0' }]);
+        return ch;
       }
     }
   }
 
   if (!segments.length) {
     log.warn('stitch: no connectors built; falling back to CH-only');
-    return buildCHOnlyRoute(start, end, vias, log);
+    const ch = await buildCHOnlyRoute(start, end, vias, log);
+    ch.evidence = ch.evidence.concat([{ type:'auto_anchors', ref:'0' }]);
+    return ch;
   }
 
   // --- append track segments when endpoints are close ---
@@ -383,9 +444,14 @@ async function buildStitchedRoute(start, end, vias, tracks, dynMaxTracks, axisKm
   }
 
   const evidence = [{ type:'GH_mode', ref:'STITCH' }];
-  if (autoAnchors.length) evidence.push({ type:'auto_anchors', ref:String(autoAnchors.length) });
-
-  return { coords, evidence, autoAnchors };
+  if (autoAnchors.length) {
+    evidence.push({ type:'auto_anchors', ref:String(autoAnchors.length) });
+    return { coords, evidence, autoAnchors };
+  }
+  log.warn('stitch: no tracks attached; falling back to CH-only');
+  const ch = await buildCHOnlyRoute(start, end, vias, log);
+  ch.evidence = ch.evidence.concat([{ type:'auto_anchors', ref:'0' }]);
+  return ch;
 }
 
 /* ========= API ========= */
@@ -402,7 +468,10 @@ app.post('/plan', async (req, res) => {
       region_hint_bbox,
       strategy = 'ch',
       off_pavement_target,
-      loop
+      loop,
+      avoid_motorways,
+      prefer_surfaces,
+      avoid_surfaces
     } = validatePlan(req.body);
 
     let a = await parsePointOrGeocode(start);
@@ -432,17 +501,25 @@ app.post('/plan', async (req, res) => {
         log.info({ clamped: true, userArea }, 'supplied bbox too large');
       }
     }
-    log.info({ pad_km: padKm, bbox_area_km2: bboxAreaKm2(bbox), shrunk }, 'corridor');
+    log.info({ pad_km: padKm, bbox_area_km2: bboxAreaKm2(bbox), shrunk, avoid_motorways: !!avoid_motorways }, 'corridor');
 
-    const tracks = await overpassTracks(bbox).catch((e) => {
+    const tracksPromise = overpassTracks(bbox).catch((e) => {
       log.warn({ err: String(e) }, 'overpass failed; proceeding without tracks');
       return [];
     });
+    let minorPromise = Promise.resolve([]);
+    if (avoid_motorways) {
+      minorPromise = minorRoadAnchors(bbox, [a, ...viaPts, b]).catch((e) => {
+        log.warn({ err: String(e) }, 'minor-road anchors failed');
+        return [];
+      });
+    }
+    const [tracks, minorAnchors] = await Promise.all([tracksPromise, minorPromise]);
+    if (minorAnchors.length) viaPts.push(...minorAnchors);
+    log.info({ count: minorAnchors.length }, 'stitch: minor-road anchors');
 
-    const dynMaxTracks =
-      kmTarget <= 60 ? 1 :
-      kmTarget <= 120 ? 2 :
-      kmTarget <= 180 ? 3 : 4;
+    const dynCap = STITCH_MAX_TRACKS > 0 ? STITCH_MAX_TRACKS : Infinity;
+    const dynMaxTracks = Math.max(1, Math.min(dynCap, Math.ceil(kmTarget / 60)));
 
     const axisKm = Math.max(4, Math.min(8, kmTarget / 25));
 
@@ -582,15 +659,14 @@ app.get('/v/:id', async (req, res) => {
   }
 });
 
-app.post('/refine', async (req, res) => { 
-  req.url = '/plan'; 
-  app._router.handle(req, res, () => {}); 
+app.post('/refine', async (req, res) => {
+  req.url = '/plan';
+  app._router.handle(req, res, () => {});
 });
 
 app.get('/health', (_, res) => res.json({ ok: true }));
 
 const PORT = process.env.PORT || 8080;
 app.listen(PORT, () =>
-  console.log(`ADV backend on :${PORT} | GH_MAX_RPS=${GH_MAX_RPS} | JOIN_RADIUS_M=${JOIN_RADIUS_M}`)
+  console.log(`ADV backend on :${PORT} | GH_MAX_RPS=${GH_MAX_RPS} | JOIN_RADIUS_M=${JOIN_RADIUS_M} | STITCH_MAX_TRACKS=${STITCH_MAX_TRACKS || '∞'}`)
 );
-
