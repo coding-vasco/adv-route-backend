@@ -212,7 +212,7 @@ async function ghRouteCH(points, profile = 'car') {
   }
   const body = {
     profile,
-    points: points.map(p => ({ lon:p[0], lat:p[1] })),
+    points: points.map(p => [p[0], p[1]]),
     points_encoded: false,
     locale: 'en',
     instructions: false
