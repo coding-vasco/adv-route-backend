@@ -1,6 +1,8 @@
 // src/server.js — CH + STITCH + geocoding + rate limiting/backoff
 // Patch A: time_budget_h/distance_km_target -> kmTarget + corridor limit
 // Patch B: auto-anchors from Overpass tracks (evenly spaced along axis)
+// Patch A' (this commit): rich connector logging + bubble up GH error text
+// Patch B' (this commit): guard badly-formed anchors & tiny segments
 // Also: pretty download redirects + Leaflet preview page.
 
 import 'dotenv/config';
@@ -76,8 +78,8 @@ async function rlFetch(url, opts) {
   return res;
 }
 
-/* ========= UTIL: coords, geocode, bbox ========= */
-const polylineLenKm = (coords)=> coords.reduce((s,c,i)=> i? s+distKm(coords[i-1],c):0,0);
+/* ========= UTIL ========= */
+const polylineLenKm = (coords)=> coords.reduce((s,c,i)=> i ? s + distKm(coords[i-1], c) : 0, 0);
 
 const tryParseCommaPair = (s) => {
   const m = String(s).trim().match(/^\s*(-?\d+(\.\d+)?)\s*,\s*(-?\d+(\.\d+)?)\s*$/);
@@ -89,11 +91,29 @@ const tryParseCommaPair = (s) => {
   return [a, b];
 };
 
+const isFiniteNum = (n) => Number.isFinite(n) && !Number.isNaN(n);
+const isPt = (p) => Array.isArray(p) && p.length === 2 && isFiniteNum(+p[0]) && isFiniteNum(+p[1]);
+const fmtPt = (p) => isPt(p) ? `${(+p[0]).toFixed(5)},${(+p[1]).toFixed(5)}` : String(p);
+
+/** Remove bad points, collapse near-duplicates, and skip micro-hops. */
+function cleanAnchors(rawAnchors, { minSegKm = 0.05 } = {}) {
+  const cleaned = [];
+  for (const p of rawAnchors) {
+    if (!isPt(p)) continue;
+    const pt = [Number(p[0]), Number(p[1])];
+    if (!cleaned.length) { cleaned.push(pt); continue; }
+    const last = cleaned[cleaned.length - 1];
+    if (distKm(last, pt) < minSegKm) continue;
+    cleaned.push(pt);
+  }
+  return cleaned;
+}
+
 // small caches to reduce calls
 const geocodeCache = new Map();   // text -> [lon,lat]
 const routeCache   = new Map();   // "lon1,lat1|lon2,lat2" -> GH JSON
 
-// GraphHopper geocoder (RL)
+/* ========= Geocoding ========= */
 async function geocodeGH(text) {
   const u = `https://graphhopper.com/api/1/geocode?q=${encodeURIComponent(text)}&limit=1&locale=en&key=${GH_KEY}`;
   const r = await rlFetch(u, { headers: { 'User-Agent': 'adv-route/1.0' }});
@@ -104,7 +124,6 @@ async function geocodeGH(text) {
   return { lon: h.point.lng, lat: h.point.lat };
 }
 
-// Nominatim fallback
 async function geocodeNominatim(text) {
   const u = `https://nominatim.openstreetmap.org/search?format=jsonv2&limit=1&q=${encodeURIComponent(text)}`;
   const r = await fetch(u, { headers: { 'User-Agent': 'adv-route/1.0' }});
@@ -119,11 +138,9 @@ async function parsePointOrGeocode(input) {
   if (Array.isArray(input)) return [Number(input[0]), Number(input[1])];
   if (input && typeof input === 'object' && 'lon' in input && 'lat' in input)
     return [Number(input.lon), Number(input.lat)];
-
   const s = String(input).trim();
   const pair = tryParseCommaPair(s);
   if (pair) return pair;
-
   if (geocodeCache.has(s)) return geocodeCache.get(s);
   try {
     const g = await geocodeGH(s); const out = [g.lon, g.lat];
@@ -170,12 +187,26 @@ async function ghRouteCH(points, profile = 'car') {
     locale: 'en',
     instructions: false
   };
-  const r = await rlFetch(`https://graphhopper.com/api/1/route?key=${GH_KEY}`, {
+  const url = `https://graphhopper.com/api/1/route?key=${GH_KEY}`;
+  const r = await rlFetch(url, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', 'User-Agent': 'adv-route/1.0' },
     body: JSON.stringify(body)
   });
-  if (!r.ok) throw new Error(`GH route HTTP ${r.status}`);
+
+  if (!r.ok) {
+    // --- Bubble up GH error text (Patch A) ---
+    let msg = `GH route HTTP ${r.status}`;
+    try {
+      const txt = await r.text();
+      if (txt) {
+        try { msg += `: ${JSON.parse(txt)?.message || txt}`; }
+        catch { msg += `: ${txt}`; }
+      }
+    } catch { /* ignore */ }
+    throw new Error(msg);
+  }
+
   const j = await r.json();
   if (cacheKey) routeCache.set(cacheKey, j);
   return j;
@@ -209,45 +240,72 @@ async function storageUrlFor(path) {
   return data?.publicUrl || null;
 }
 
+/* ========= Stitch builder ========= */
 async function buildStitchedRoute(start, end, vias, tracks, dynMaxTracks, axisKm) {
   const requestId = nanoid();
   const log = logger.child({ requestId });
 
-  const gh = await ghRouteCH([start, ...vias, end], 'car');
-  let coords = gh.paths[0].points.coordinates.map(c => [c[0], c[1]]);
-
-  let selected = [];
+  // --- choose a small set of candidate tracks ---
+  const selected = [];
   for (const t of tracks) {
-    if (selected.length >= dynMaxTracks) break;
+    if (!t?.coords?.length) continue;
     selected.push(t);
+    if (selected.length >= dynMaxTracks) break;
   }
+  log.info({ selected_track_ids: selected.map(t => t.id), dynMaxTracks }, 'stitch: selected tracks');
 
+  // --- clean anchors (Patch B) ---
+  const rawAnchors = [start, ...vias, end];
+  const anchors = cleanAnchors(rawAnchors, { minSegKm: 0.05 });
+  if (anchors.length < 2) throw new Error('not enough valid anchors after cleaning');
+
+  // --- build CH connectors with rich logging (Patch A) ---
   const segments = [];
-  let last = start;
-  for (const next of [ ...vias, end ]) {
-    const ghSeg = await ghRouteCH([last, next], 'car');
-    const segCoords = ghSeg.paths[0].points.coordinates.map(c=>[c[0],c[1]]);
-    segments.push({type:'connector', coords:segCoords});
-    last = next;
+  let last = anchors[0];
+
+  for (let i = 1; i < anchors.length; i++) {
+    const next = anchors[i];
+    const hopKm = distKm(last, next);
+    if (hopKm < 0.05) {
+      log.warn({ i, from: fmtPt(last), to: fmtPt(next), hopKm }, 'stitch: skip tiny connector');
+      continue;
+    }
+    try {
+      const ghSeg = await ghRouteCH([last, next], 'car');
+      const segCoords = ghSeg.paths[0].points.coordinates.map(c=>[c[0],c[1]]);
+      const segKm = polylineLenKm(segCoords);
+      log.info({ i, from: fmtPt(last), to: fmtPt(next), segKm }, 'stitch: connector');
+      segments.push({ type:'connector', coords: segCoords });
+      last = next;
+    } catch (err) {
+      // bubble GH message; also log connector that failed
+      log.error({ i, from: fmtPt(last), to: fmtPt(next), err: String(err) }, 'stitch: connector failed');
+      throw err;
+    }
   }
 
+  // --- append track segments when endpoints are close ---
   const merged=[]; let selIdx=0;
   for (const seg of segments){
     merged.push(seg);
     const track = selected[selIdx];
     const endPt = seg.coords[seg.coords.length-1];
     if (track && distKm(endPt, track.coords[0]) < 0.15) {
+      const trackKm = polylineLenKm(track.coords);
+      log.info({ id: track.id, km: trackKm }, 'stitch: attach track');
       merged.push({type:'track', id:track.id, coords:track.coords});
       selIdx++;
     }
   }
 
+  // --- merge to one polyline + collect autoAnchors for evidence ---
+  const coords = [];
   const autoAnchors = [];
-  coords = [merged[0].coords[0]];
+  if (merged.length) coords.push(merged[0].coords[0]);
   for (const seg of merged) {
     const c = seg.coords.slice(1);
     coords.push(...c);
-    if (seg.type === 'track') autoAnchors.push(seg.coords[0]);
+    if (seg.type === 'track' && seg.coords?.length) autoAnchors.push(seg.coords[0]);
   }
 
   const evidence = [{ type:'GH_mode', ref:'STITCH' }];
@@ -256,7 +314,7 @@ async function buildStitchedRoute(start, end, vias, tracks, dynMaxTracks, axisKm
   return { coords, evidence, autoAnchors };
 }
 
-/* ========= ROUTE PLANNING ========= */
+/* ========= API ========= */
 app.post('/plan', async (req, res) => {
   const requestId = nanoid();
   const log = logger.child({ requestId });
