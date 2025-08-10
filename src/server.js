@@ -333,9 +333,10 @@ async function ghRoute(points, { mode = 'ch', customModel } = {}) {
     instructions: false
   };
   if (mode === 'flex') {
-    body.ch = { disable: true };
-    if (customModel) body.custom_model = customModel;
-  }
+  // GraphHopper expects a *top-level* dotted key: "ch.disable": true
+  body['ch.disable'] = true;
+  if (customModel) body.custom_model = customModel;
+}
   const url = `https://graphhopper.com/api/1/route?key=${GH_KEY}`;
   const r = await rlFetch(url, {
     method: 'POST',
@@ -389,29 +390,70 @@ async function storageUrlFor(path) {
 }
 
 /* ========= Helpers ========= */
+
+/** Split a sequence of points into GH-safe legs (max points per request).
+ *  Keeps continuity by overlapping the last point of each leg with the first of the next.
+ */
+function chunkPointsForGH(points, max = 5) {
+  if (!Array.isArray(points) || points.length <= max) return [points];
+  const legs = [];
+  let i = 0;
+  while (i < points.length - 1) {
+    const end = Math.min(i + max - 1, points.length - 1); // last index included in this leg
+    legs.push(points.slice(i, end + 1));
+    i = end; // next leg starts at previous last point (overlap by 1)
+  }
+  return legs;
+}
+
+/** Build a single GH route (no tracks), chunking waypoints to respect the free-tier 5-point limit.
+ *  If a FLEX/custom-model leg fails, retry that leg with CH and continue.
+ */
 async function buildCHOnlyRoute(a, b, viaPts, log, { customModel } = {}) {
-  const points = collapseNearDuplicates([a, ...viaPts, b], 30);
+  let points = collapseNearDuplicates([a, ...viaPts, b], 30);
   if (points.length >= 2 && sameCoordinate(points[0], points[points.length - 1], 10)) {
+    // tiny jitter to avoid CH "same point" quirks in loops
     points[points.length - 1] = jitterPoint(points[points.length - 1], 11);
   }
-  const mode = customModel ? 'flex' : 'ch';
-  try {
-    const gh = await ghRoute(points, { mode, customModel });
-    const coords = gh.paths[0].points.coordinates.map(c => [c[0], c[1]]);
-    log?.info({ pts: points.length, km: +polylineLenKm(coords).toFixed(1) }, `${mode.toUpperCase()} route built`);
-    const ev = [{ type: 'GH_mode', ref: mode === 'flex' ? 'FLEX' : 'CH' }];
-    if (customModel) ev.push({ type: 'custom_model', ref: 'used' });
-    return { coords, evidence: ev, autoAnchors: [] };
-  } catch (err) {
-    if (mode === 'flex') {
-      log?.error({ err: String(err) }, 'flex route failed; falling back to CH');
-      const gh = await ghRoute(points, { mode: 'ch' });
-      const coords = gh.paths[0].points.coordinates.map(c => [c[0], c[1]]);
-      const ev = [{ type: 'GH_mode', ref: 'CH' }, { type: 'custom_model', ref: 'fallback' }];
-      return { coords, evidence: ev, autoAnchors: [] };
+
+  const wantFlex = !!customModel;
+  const legs = chunkPointsForGH(points, 5);
+
+  let coords = [];
+  let fallbackOccurred = false;
+
+  for (let li = 0; li < legs.length; li++) {
+    const leg = legs[li];
+
+    // First try with FLEX if we have a custom model; else CH
+    try {
+      const gh = await ghRoute(leg, { mode: wantFlex ? 'flex' : 'ch', customModel });
+      const seg = gh.paths[0].points.coordinates.map(c => [c[0], c[1]]);
+      coords = li === 0 ? seg : coords.concat(seg.slice(1));
+    } catch (err) {
+      if (wantFlex) {
+        // Retry this leg with CH, continue the whole route
+        log?.warn({ leg: li + 1, err: String(err) }, 'FLEX leg failed; retrying with CH');
+        const gh = await ghRoute(leg, { mode: 'ch' });
+        const seg = gh.paths[0].points.coordinates.map(c => [c[0], c[1]]);
+        coords = li === 0 ? seg : coords.concat(seg.slice(1));
+        fallbackOccurred = true;
+      } else {
+        throw err;
+      }
     }
-    throw err;
   }
+
+  const totalKm = +polylineLenKm(coords).toFixed(1);
+  log?.info(
+    { pts: points.length, legs: legs.length, km: totalKm, mode: wantFlex ? (fallbackOccurred ? 'FLEX→CH' : 'FLEX') : 'CH' },
+    'CH-only route built (chunked)'
+  );
+
+  const evidence = [{ type: 'GH_mode', ref: wantFlex ? (fallbackOccurred ? 'FLEX→CH' : 'FLEX') : 'CH' }];
+  if (wantFlex) evidence.push({ type: 'custom_model', ref: fallbackOccurred ? 'fallback' : 'used' });
+
+  return { coords, evidence, autoAnchors: [] };
 }
 
 /* ========= Stitch builder ========= */
