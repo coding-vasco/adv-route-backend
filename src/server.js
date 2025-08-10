@@ -225,7 +225,7 @@ out geom;`;
   if (total <= 0) return [];
   const step = total / (count + 1);
   let distAcc = 0, target = step;
-  for (let i = 1; i < axisLine.length && samples.length < count; i++) {
+for (let i = 1; i < axisLine.length && samples.length < count; i++) {
     const a = axisLine[i - 1], b = axisLine[i];
     const seg = distKm(a, b);
     while (distAcc + seg >= target && samples.length < count) {
@@ -250,6 +250,7 @@ out geom;`;
   return anchors;
 }
 
+// Construct a GraphHopper custom model based on rider preferences
 function buildCustomModel({ avoid_motorways, avoid_tolls, prefer_surfaces = [], avoid_surfaces = [] } = {}) {
   const model = {
     priority: [
@@ -588,7 +589,7 @@ app.post('/plan', async (req, res) => {
     if (Array.isArray(region_hint_bbox) && region_hint_bbox.length === 4) {
       const userBbox = region_hint_bbox.map(Number);
       const userArea = bboxAreaKm2(userBbox);
-@@ -501,95 +594,113 @@ app.post('/plan', async (req, res) => {
+@@ -501,95 +595,113 @@ app.post('/plan', async (req, res) => {
         log.info({ clamped: true, userArea }, 'supplied bbox too large');
       }
     }
