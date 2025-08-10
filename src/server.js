@@ -588,7 +588,7 @@ app.post('/plan', async (req, res) => {
     if (Array.isArray(region_hint_bbox) && region_hint_bbox.length === 4) {
       const userBbox = region_hint_bbox.map(Number);
       const userArea = bboxAreaKm2(userBbox);
-@@ -501,95 +594,107 @@ app.post('/plan', async (req, res) => {
+@@ -501,95 +594,113 @@ app.post('/plan', async (req, res) => {
         log.info({ clamped: true, userArea }, 'supplied bbox too large');
       }
     }
@@ -619,7 +619,13 @@ app.post('/plan', async (req, res) => {
       (Array.isArray(avoid_surfaces) && avoid_surfaces.length);
     const customModel = wantCustom ? buildCustomModel({ avoid_motorways, avoid_tolls, prefer_surfaces, avoid_surfaces }) : null;
     if (customModel) {
-      log.info({ custom_model_priority: customModel.priority.length, custom_model_speed: customModel.speed.length }, 'custom model');
+      log.info(
+        {
+          custom_model_priority: customModel.priority.length,
+          custom_model_speed: customModel.speed.length
+        },
+        'custom model'
+      );
     }
 
     let coords, note;
