@@ -23,4 +23,35 @@ Run unit tests with:
 
 ```bash
 npm test
-```
+
+​:codex-terminal-citation[codex-terminal-citation]{line_range_start=1 line_range_end=26 terminal_chunk_id=2ed1ff}​
+
+---
+
+### `package.json`
+```json
+{
+  "name": "adv-route-backend",
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "node --watch src/server.js",
+    "test": "vitest"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.45.4",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "nanoid": "^5.0.7",
+    "node-fetch": "^3.3.2",
+    "pino": "^9.1.0",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "vitest": "^1.6.0"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
