@@ -1,5 +1,3 @@
-SERVER.JS PATCH 
-
 // src/server.js — CH + STITCH + geocoding + rate limiting/backoff
 // Patch A: time_budget_h/distance_km_target -> kmTarget + corridor limit
 // Patch B: auto-anchors from Overpass tracks (evenly spaced along axis)
