@@ -496,9 +496,10 @@ out geom 1;`;
 }
 
 /* ========= Stitch builder ========= */
-async function buildStitchedRoute(start, end, vias, tracks, dynMaxTracks, axisKm, parentLog, { customModel } = {}) {
+async function buildStitchedRoute(start, end, vias, tracks, dynMaxTracks, axisKm, parentLog, opts = {}) {
   const requestId = nanoid();
   const log = (parentLog || logger).child({ requestId });
+  const useMotorwayRescue = !!opts.avoid_motorways;
 
   // --- choose a small set of candidate tracks ---
   const selected = [];
@@ -736,7 +737,7 @@ app.post('/plan', async (req, res) => {
 
     if (strategy === 'stitch') {
       try {
-      const built = await buildStitchedRoute(a, b, viaPts, tracks, dynMaxTracks, axisKm, log, { customModel, avoid_motorways });
+      const built = await buildStitchedRoute(a, b, viaPts, tracks, dynMaxTracks, axisKm, log, { avoid_motorways });
         coords = built.coords;
         evidence = built.evidence;
         note = `STITCH mode: CH connectors + OSM tracks. Corridor ~${padKm.toFixed(0)}km pad, kmTarget≈${kmTarget.toFixed(0)}.`;
