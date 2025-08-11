@@ -1,763 +1,687 @@
-// src/server.js — CH + STITCH + geocoding + rate limiting/backoff
-// Patch A: time_budget_h/distance_km_target -> kmTarget + corridor limit
-// Patch B: auto-anchors from Overpass tracks (evenly spaced along axis)
-// Patch C: JOIN_RADIUS_M, de-dup & loop jitter, CH fallback when stitching fails
-// Patch D: minor-road anchors, extended dirt surfaces, STITCH_MAX_TRACKS env, motorway rescue logging
-// Also: pretty download redirects + Leaflet preview page.
+// src/server.js — CH-only backend with stitch guards, coords support, capped Overpass, and tighter logging
+// Works on GraphHopper free tier (CH, <=5 points/request). No FLEX/custom models.
+//
+// Key fixes in this revision:
+// - Add time budget for stitch phase (default 25s). On expiry → clean CH fallback + evidence.
+// - Motorway-rescue loop guards: MAX_RESCUE_ATTEMPTS_PER_PAIR / TOTAL + dedup hash; correct attempt increment.
+// - Overpass timeout and hard caps with graceful retry/shrink.
+// - Log once per pair attempt with concise context.
+// - Native support for start_coords/end_coords/vias_coords while keeping string inputs (back-compatible).
+//
+// Endpoints:
+//   GET  /health
+//   POST /plan
+//   GET  /download/route/:id.:ext
+//   GET  /v/:id (Leaflet preview)
 
-import 'dotenv/config';
-import express from 'express';
-import { createClient } from '@supabase/supabase-js';
-import { customAlphabet } from 'nanoid';
-import pino from 'pino';
-import { corridorBBox, bboxAreaKm2, distKm } from './lib/bbox.js';
-import { validatePlan } from './lib/normalize.js';
-import { ZodError } from 'zod';
+"use strict";
 
-const app = express();
-app.use(express.json({ limit: '2mb' }));
+const express = require("express");
+const crypto = require("crypto");
+const { createClient } = require("@supabase/supabase-js");
+const path = require("path");
 
-/* ========= ENV ========= */
-const need = (k, hard = true) => {
-  if (!process.env[k] || String(process.env[k]).trim() === '') {
-    const msg = `[ENV] Missing ${k}`;
-    if (hard) { console.error(msg); process.exit(1); }
-    else { console.warn(msg); }
+// ----- Environment helpers -----
+function need(name, def = undefined) {
+  const v = process.env[name] ?? def;
+  if (v === undefined || v === null || v === "") {
+    throw new Error(`Missing required env var: ${name}`);
   }
-};
-need('GH_KEY');
-need('OVERPASS_URL');
-need('STORAGE');
-need('SUPABASE_URL');
-need('SUPABASE_SERVICE_ROLE');
-need('SUPABASE_BUCKET');
-need('PUBLIC_BASE_URL', false); // optional, for pretty links
-
-if (process.env.STORAGE !== 'SUPABASE') {
-  console.error('[ENV] STORAGE must be SUPABASE for this build.');
-  process.exit(1);
+  return v;
 }
-
-const GH_KEY = process.env.GH_KEY;
-const OVERPASS_URL = process.env.OVERPASS_URL;
-const SUPABASE_URL = process.env.SUPABASE_URL;
-const SUPABASE_SERVICE_ROLE = process.env.SUPABASE_SERVICE_ROLE;
-const SUPABASE_BUCKET = process.env.SUPABASE_BUCKET;
-const SUPABASE_PUBLIC_BUCKET =
-  String(process.env.SUPABASE_PUBLIC_BUCKET || 'true').toLowerCase() === 'true';
-const PUBLIC_BASE_URL = (process.env.PUBLIC_BASE_URL || '').replace(/\/$/, '');
-
-const PAD_KM_MIN = Number(process.env.PAD_KM_MIN || 8);
-const PAD_KM_MAX = Number(process.env.PAD_KM_MAX || 25);
-const BBOX_AREA_MAX_KM2 = Number(process.env.BBOX_AREA_MAX_KM2 || 2500);
-
-// GH rate limiting (safe for free plan)
-const GH_MAX_RPS = Math.max(0.5, Number(process.env.GH_MAX_RPS || 2));   // ≈120/min
-const GH_MIN_GAP_MS = Math.max(50, Math.floor(1000 / GH_MAX_RPS));
-const GH_JITTER_MS = Math.max(0, Number(process.env.GH_JITTER_MS || 60));
-
-// Join/attach thresholds
-const JOIN_RADIUS_M = parseInt(process.env.JOIN_RADIUS_M || '300', 10); // default 300 m
-const JOIN_RADIUS_KM = Math.max(0.05, JOIN_RADIUS_M / 1000);            // never below 50 m
-const STITCH_MAX_TRACKS = parseInt(process.env.STITCH_MAX_TRACKS || '0', 10); // 0 = no hard cap
-
-const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE, { auth: { persistSession: false } });
-const nanoid = customAlphabet('abcdefghijklmnopqrstuvwxyz0123456789', 12);
-const logger = pino();
-
-// Anti-motorway tuning for CH mode (rescue)
-const MAX_MOTORWAY_SHARE = Math.max(0, Math.min(1, Number(process.env.MAX_MOTORWAY_SHARE ?? 0.12))); // 12%
-const RESCUE_SPLITS_PER_CONNECTOR = Math.max(0, parseInt(process.env.RESCUE_SPLITS_PER_CONNECTOR ?? '2', 10)); // max extra anchors per connector
-const RESCUE_SEARCH_RADIUS_M = Math.max(100, parseInt(process.env.RESCUE_SEARCH_RADIUS_M ?? '1200', 10)); // Overpass around: radius
-
-/* ========= RATE-LIMITED FETCH ========= */
-const sleep = (ms) => new Promise(r => setTimeout(r, ms));
-let lastTs = 0;
-async function rlFetch(url, opts) {
-  const now = Date.now();
-  const wait = Math.max(0, (lastTs + GH_MIN_GAP_MS) - now) + Math.floor(Math.random() * GH_JITTER_MS);
-  if (wait) await sleep(wait);
-  lastTs = Date.now();
-
-  const res = await fetch(url, opts);
-  if (res.status === 429) {
-    const ra = res.headers.get('retry-after');
-    const waitMs = ra ? Math.max(0, Number(ra) * 1000) : 1200;
-    await sleep(Math.max(waitMs, 800));
-    return rlFetch(url, opts);
-  }
-  return res;
-}
-
-/* ========= UTIL ========= */
-const polylineLenKm = (coords)=> coords.reduce((s,c,i)=> i ? s + distKm(coords[i-1], c) : 0, 0);
-
-const tryParseCommaPair = (s) => {
-  const m = String(s).trim().match(/^\s*(-?\d+(\.\d+)?)\s*,\s*(-?\d+(\.\d+)?)\s*$/);
-  if (!m) return null;
-  let a = parseFloat(m[1]), b = parseFloat(m[3]);
-  const looksLatLon = Math.abs(a) <= 90 && Math.abs(b) <= 180;
-  const looksLonLat = Math.abs(a) <= 180 && Math.abs(b) <= 90;
-  if (looksLatLon && !looksLonLat) return [b, a];
-  return [a, b];
-};
-
-const isFiniteNum = (n) => Number.isFinite(n) && !Number.isNaN(n);
-const isPt = (p) => Array.isArray(p) && p.length === 2 && isFiniteNum(+p[0]) && isFiniteNum(+p[1]);
-const fmtPt = (p) => isPt(p) ? `${(+p[0]).toFixed(5)},${(+p[1]).toFixed(5)}` : String(p);
-
-function sameCoordinate(a, b, meters = 15) {
-  if (!isPt(a) || !isPt(b)) return false;
-  return distKm(a, b) <= meters / 1000;
-}
-function jitterPoint(p, meters = 10) {
-  const dx = (Math.random() - 0.5) * (meters / 111320) * 2; // ~ meters to lon deg at equator
-  const dy = (Math.random() - 0.5) * (meters / 110540) * 2; // ~ meters to lat deg
-  return [p[0] + dx, p[1] + dy];
-}
-function collapseNearDuplicates(points, meters = 30) {
-  const out = [];
-  for (const p of points) {
-    if (!isPt(p)) continue;
-    if (!out.length) { out.push(p); continue; }
-    if (distKm(out[out.length - 1], p) < meters / 1000) continue;
-    out.push(p);
-  }
-  return out;
-}
-
-/** Remove bad points, collapse near-duplicates, and skip micro-hops. */
-function cleanAnchors(rawAnchors, { minSegKm = 0.05 } = {}) {
-  const cleaned = [];
-  const summary = { malformed: 0, tooClose: 0, kept: 0 };
-  let lastKept = null;
-  for (const p of rawAnchors) {
-    if (!isPt(p)) { summary.malformed++; continue; }
-    const pt = [Number(p[0]), Number(p[1])];
-    if (lastKept && distKm(lastKept, pt) < minSegKm) { summary.tooClose++; continue; }
-    cleaned.push(pt);
-    summary.kept++;
-    lastKept = pt;
-  }
-  return { cleaned, summary };
-}
-
-// small caches to reduce calls
-const geocodeCache = new Map();   // text -> [lon,lat]
-const routeCache   = new Map();   // cache for 2‑point CH routes
-
-/* ========= Geocoding ========= */
-async function geocodeGH(text) {
-  const u = `https://graphhopper.com/api/1/geocode?q=${encodeURIComponent(text)}&limit=1&locale=en&key=${GH_KEY}`;
-  const r = await rlFetch(u, { headers: { 'User-Agent': 'adv-route/1.0' }});
-  if (!r.ok) throw new Error(`GH geocode HTTP ${r.status}`);
-  const j = await r.json();
-  const h = j.hits?.[0];
-  if (!h?.point) throw new Error('GH geocode: no hits');
-  return { lon: h.point.lng, lat: h.point.lat };
-}
-
-async function geocodeNominatim(text) {
-  const u = `https://nominatim.openstreetmap.org/search?format=jsonv2&limit=1&q=${encodeURIComponent(text)}`;
-  const r = await fetch(u, { headers: { 'User-Agent': 'adv-route/1.0' }});
-  if (!r.ok) throw new Error(`Nominatim HTTP ${r.status}`);
-  const j = await r.json();
-  const h = j?.[0];
-  if (!h) throw new Error('Nominatim: no hits');
-  return { lon: parseFloat(h.lon), lat: parseFloat(h.lat) };
-}
-
-async function parsePointOrGeocode(input) {
-  if (Array.isArray(input)) return [Number(input[0]), Number(input[1])];
-  if (input && typeof input === 'object' && 'lon' in input && 'lat' in input)
-    return [Number(input.lon), Number(input.lat)];
-  const s = String(input).trim();
-  const pair = tryParseCommaPair(s);
-  if (pair) return pair;
-  if (geocodeCache.has(s)) return geocodeCache.get(s);
-  try {
-    const g = await geocodeGH(s); const out = [g.lon, g.lat];
-    geocodeCache.set(s, out); return out;
-  } catch {
-    const g2 = await geocodeNominatim(s); const out = [g2.lon, g2.lat];
-    geocodeCache.set(s, out); return out;
-  }
-}
-
-/* ========= Overpass, GH CH, Supabase ========= */
-async function overpassTracks(bbox) {
-  if (!bbox) return [];
-  const [south, west, north, east] = bbox;
-  const q = `
-[out:json][timeout:60];
-way["highway"="track"]
-  (${south},${west},${north},${east})
-  ["surface"~"gravel|compacted|fine_gravel|ground|earth|mud|pebblestone|unpaved"]
-  ["tracktype"~"grade1|grade2|grade3"];
-out geom;`;
-  const r = await fetch(OVERPASS_URL, { method: 'POST', body: q });
-  if (!r.ok) throw new Error(`Overpass error: ${await r.text()}`);
-  const j = await r.json();
-  return (j.elements || []).map((w) => ({
-    id: String(w.id),
-    coords: (w.geometry || []).map((g) => [g.lon, g.lat])
-  }));
-}
-
-async function minorRoadAnchors(bbox, axisLine, n = 4) {
-  if (!bbox || !Array.isArray(axisLine) || axisLine.length < 2) return [];
-  const [south, west, north, east] = bbox;
-  const q = `
-[out:json][timeout:60];
-way["highway"~"tertiary|unclassified|residential|service|track"][!"motorway"][!"trunk"][!"primary"]
-  (${south},${west},${north},${east});
-out geom;`;
-  const r = await fetch(OVERPASS_URL, { method: 'POST', body: q });
-  if (!r.ok) throw new Error(`Overpass error: ${await r.text()}`);
-  const j = await r.json();
-  const pts = [];
-  for (const w of j.elements || []) {
-    for (const g of w.geometry || []) pts.push([g.lon, g.lat]);
-  }
-  if (!pts.length) return [];
-  const count = Math.max(3, Math.min(6, n));
-  const samples = [];
-  const total = polylineLenKm(axisLine);
-  if (total <= 0) return [];
-  const step = total / (count + 1);
-  let distAcc = 0, target = step;
-  for (let i = 1; i < axisLine.length && samples.length < count; i++) {
-    const a = axisLine[i - 1], b = axisLine[i];
-    const seg = distKm(a, b);
-    while (distAcc + seg >= target && samples.length < count) {
-      const ratio = (target - distAcc) / seg;
-      const sx = a[0] + (b[0] - a[0]) * ratio;
-      const sy = a[1] + (b[1] - a[1]) * ratio;
-      samples.push([sx, sy]);
-      target += step;
-    }
-    distAcc += seg;
-  }
-  const anchors = [];
-  for (const s of samples) {
-    let best = pts[0];
-    let bestD = distKm(s, best);
-    for (const p of pts) {
-      const d = distKm(s, p);
-      if (d < bestD) { bestD = d; best = p; }
-    }
-    anchors.push(best);
-  }
-  return anchors;
-}
-
-/* ========= GraphHopper CH routing with road_class details ========= */
-async function ghRouteCH(points, profile = 'car') {
-  let pts = collapseNearDuplicates(points, 30);
-  if (pts.length >= 2 && sameCoordinate(pts[0], pts[pts.length - 1], 10)) {
-    pts[pts.length - 1] = jitterPoint(pts[pts.length - 1], 11);
-  }
-  let cacheKey = null;
-  if (pts.length === 2) {
-    const a = pts[0], b = pts[1];
-    const keyA = `${a[0].toFixed(5)},${a[1].toFixed(5)}`;
-    const keyB = `${b[0].toFixed(5)},${b[1].toFixed(5)}`;
-    cacheKey = `ch|${keyA}|${keyB}`;
-    if (routeCache.has(cacheKey)) return routeCache.get(cacheKey);
-  }
-  const body = {
-    profile,
-    points: pts.map(p => [p[0], p[1]]),
-    points_encoded: false,
-    locale: 'en',
-    instructions: false,
-    details: ['road_class'] // ask GH for road_class ranges in speed mode
-  };
-  const url = `https://graphhopper.com/api/1/route?key=${GH_KEY}`;
-  const r = await rlFetch(url, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'User-Agent': 'adv-route/1.0' },
-    body: JSON.stringify(body)
-  });
-
-  if (!r.ok) {
-    let msg = `GH route HTTP ${r.status}`;
-    try { const txt = await r.text(); msg += txt ? `: ${(() => { try { return JSON.parse(txt)?.message || txt; } catch { return txt; } })()}` : ''; } catch {}
-    throw new Error(msg);
-  }
-
-  const j = await r.json();
-  const coords = j.paths[0].points.coordinates.map(c => [c[0], c[1]]);
-  const details = j.paths[0].details || {};
-  const out = { raw: j, coords, details };
-  if (cacheKey) routeCache.set(cacheKey, out);
-  return out;
-}
-
-function toGPX(name, coords) {
-  const trkpts = coords.map(c => `<trkpt lon="${c[0]}" lat="${c[1]}"></trkpt>`).join('');
-  return `<?xml version="1.0" encoding="UTF-8"?><gpx version="1.1" creator="adv-route"><trk><name>${name}</name><trkseg>${trkpts}</trkseg></trk></gpx>`;
-}
-
-async function uploadToSupabase(path, data, contentType) {
-  const { data: res, error } = await supabase.storage.from(SUPABASE_BUCKET).upload(path, data, {
-    contentType,
-    upsert: true
-  });
-  if (error) throw error;
-  if (!SUPABASE_PUBLIC_BUCKET) {
-    const { data: signed } = await supabase.storage.from(SUPABASE_BUCKET).createSignedUrl(path, 60 * 60 * 24 * 30);
-    return signed?.signedUrl || null;
-  }
-  const { data: pub } = supabase.storage.from(SUPABASE_BUCKET).getPublicUrl(path);
-  return pub.publicUrl || null;
-}
-
-async function storageUrlFor(path) {
-  if (!SUPABASE_PUBLIC_BUCKET) {
-    const { data } = await supabase.storage.from(SUPABASE_BUCKET).createSignedUrl(path, 60 * 60);
-    return data?.signedUrl || null;
-  }
-  const { data } = supabase.storage.from(SUPABASE_BUCKET).getPublicUrl(path);
-  return data?.publicUrl || null;
-}
-
-/* ========= Helpers (CH-only) ========= */
-
-// Split a sequence of points into GH‑safe legs (max points per request). Overlap by 1.
-function chunkPointsForGH(points, max = 5) {
-  if (!Array.isArray(points) || points.length <= max) return [points];
-  const legs = [];
-  let i = 0;
-  while (i < points.length - 1) {
-    const end = Math.min(i + max - 1, points.length - 1);
-    legs.push(points.slice(i, end + 1));
-    i = end; // overlap the last point
-  }
-  return legs;
-}
-
-/** Build a single GH route using CH only, chunked for the free plan. */
-async function buildCHOnlyRoute(a, b, viaPts, log) {
-  let points = collapseNearDuplicates([a, ...viaPts, b], 30);
-  if (points.length >= 2 && sameCoordinate(points[0], points[points.length - 1], 10)) {
-    points[points.length - 1] = jitterPoint(points[points.length - 1], 11);
-  }
-
-  const legs = chunkPointsForGH(points, 5);
-  let coords = [];
-
-  for (let li = 0; li < legs.length; li++) {
-    const leg = legs[li];
-    const gh = await ghRouteCH(leg, 'car');          // CH only
-    const seg = gh.coords;
-    coords = li === 0 ? seg : coords.concat(seg.slice(1));
-  }
-
-  const totalKm = +polylineLenKm(coords).toFixed(1);
-  log?.info({ pts: points.length, legs: legs.length, km: totalKm, mode: 'CH' }, 'CH-only route built (chunked)');
-  return { coords, evidence: [{ type: 'GH_mode', ref: 'CH' }], autoAnchors: [] };
-}
-
-function lengthKmBetween(points, i0, i1) {
-  let km = 0;
-  for (let i = Math.max(1, i0 + 1); i <= Math.min(points.length - 1, i1); i++) {
-    km += distKm(points[i - 1], points[i]);
-  }
-  return km;
-}
-
-function motorwayShareFromDetails(points, details) {
-  const rc = details?.road_class || [];
-  if (!rc.length) return { share: 0, longestBad: null, totalKm: polylineLenKm(points) };
-
-  const BAD = new Set(['MOTORWAY', 'TRUNK']);
-  let badKm = 0;
-  let totalKm = polylineLenKm(points);
-  let longestBad = null; // { i0, i1, km }
-
-  for (const [i0, i1, cls] of rc) {
-    if (!BAD.has(String(cls).toUpperCase())) continue;
-    const km = lengthKmBetween(points, i0, i1);
-    badKm += km;
-    if (!longestBad || km > longestBad.km) longestBad = { i0, i1, km };
-  }
-  const share = totalKm > 0 ? badKm / totalKm : 0;
-  return { share, longestBad, totalKm };
-}
-
-// Find a minor-road point near (lon,lat) using Overpass "around:" search.
-async function findNearestMinorRoadPointAround(lon, lat, radiusM = RESCUE_SEARCH_RADIUS_M) {
-  const q = `
-[out:json][timeout:25];
-way(around:${radiusM},${lat},${lon})["highway"~"tertiary|unclassified|residential|service|track"];
-out geom 1;`;
-  const r = await fetch(OVERPASS_URL, { method: 'POST', body: q });
-  if (!r.ok) return null;
-  const j = await r.json();
-  const cand = (j.elements || [])[0];
-  if (!cand) return null;
-  const g = (cand.geometry || [])[0];
-  if (!g) return null;
-  return [g.lon, g.lat];
-}
-
-/* ========= Stitch builder (CH connectors + optional rescue) ========= */
-async function buildStitchedRoute(start, end, vias, tracks, dynMaxTracks, axisKm, parentLog, opts = {}) {
-  const requestId = nanoid();
-  const log = (parentLog || logger).child({ requestId });
-  const useMotorwayRescue = !!opts.avoid_motorways;
-
-  // choose a small set of candidate tracks
-  const selected = [];
-  for (const t of tracks) {
-    if (!t?.coords?.length) continue;
-    selected.push(t);
-    if (selected.length >= dynMaxTracks) break;
-  }
-  log.info({ selected_track_ids: selected.map(t => t.id), dynMaxTracks }, 'stitch: selected tracks');
-
-  // clean anchors
-  const rawAnchors = [start, ...vias, end];
-  const { cleaned: anchors, summary } = cleanAnchors(rawAnchors, { minSegKm: 0.05 });
-  log.info({ cleaning: summary, anchors: anchors.map(fmtPt) }, 'stitch: cleaned anchors');
-
-  if (anchors.length < 2) {
-    log.warn({ count: anchors.length }, 'anchors insufficient; falling back to CH-only');
-    const ch = await buildCHOnlyRoute(start, end, vias, log);
-    ch.evidence = ch.evidence.concat([{ type:'auto_anchors', ref:'0' }]);
-    return ch;
-  }
-
-  // build connectors with rescue
-  const segments = [];
-  let last = anchors[0];
-
-  for (let i = 1; i < anchors.length; i++) {
-    let next = anchors[i];
-    const hopKm = distKm(last, next);
-    if (hopKm < 0.05) {
-      log.warn({ i, from: fmtPt(last), to: fmtPt(next), hopKm }, 'stitch: skip tiny connector');
-      continue;
-    }
-
-    let attempts = 0;
-    let built = false;
-
-    while (!built) {
-      const pair = collapseNearDuplicates([last, next], 30);
-      if (pair.length < 2) break;
-
-      try {
-        const ghSeg = await ghRouteCH(pair, 'car'); // CH with details
-        const segCoords = ghSeg.coords;
-        const segKm = polylineLenKm(segCoords);
-
-        if (useMotorwayRescue && RESCUE_SPLITS_PER_CONNECTOR > 0) {
-          const { share, longestBad } = motorwayShareFromDetails(segCoords, ghSeg.details);
-          if (share > MAX_MOTORWAY_SHARE && attempts < RESCUE_SPLITS_PER_CONNECTOR && longestBad) {
-            const midIdx = Math.floor((longestBad.i0 + longestBad.i1) / 2);
-            const mid = segCoords[Math.max(0, Math.min(segCoords.length - 1, midIdx))];
-            const rescue = await findNearestMinorRoadPointAround(mid[0], mid[1], RESCUE_SEARCH_RADIUS_M);
-            log.warn({ i, share: +share.toFixed(3), attempts, mid: fmtPt(mid), rescue: rescue ? fmtPt(rescue) : null }, 'stitch: motorway rescue');
-
-            if (rescue) {
-              anchors.splice(i, 0, rescue);
-              next = rescue;
-              attempts++;
-              continue;
-            }
-          }
-        }
-
-        log.info({ i, from: fmtPt(last), to: fmtPt(next), segKm }, 'stitch: connector');
-        segments.push({ type: 'connector', coords: segCoords });
-        last = next;
-        built = true;
-      } catch (err) {
-        log.error({ i, from: fmtPt(last), to: fmtPt(next), err: String(err) }, 'stitch: connector failed');
-        if (i + 1 < anchors.length) {
-          const skipTo = anchors[i + 1];
-          try {
-            const ghSeg2 = await ghRouteCH(collapseNearDuplicates([last, skipTo], 30), 'car');
-            const segCoords2 = ghSeg2.coords;
-            const segKm2 = polylineLenKm(segCoords2);
-            log.warn({ i, skippedTo: fmtPt(skipTo), segKm2 }, 'stitch: recovered by skipping one anchor');
-            segments.push({ type: 'connector', coords: segCoords2 });
-            last = skipTo;
-            i++; // skip one anchor
-            built = true;
-          } catch (err2) {
-            log.error({ i, err2: String(err2) }, 'stitch: recovery failed; falling back to CH-only');
-            const ch = await buildCHOnlyRoute(start, end, vias, log);
-            ch.evidence = ch.evidence.concat([{ type: 'auto_anchors', ref: '0' }]);
-            return ch;
-          }
-        } else {
-          log.error({ i }, 'stitch: last connector failed; falling back to CH-only');
-          const ch = await buildCHOnlyRoute(start, end, vias, log);
-          ch.evidence = ch.evidence.concat([{ type: 'auto_anchors', ref: '0' }]);
-          return ch;
-        }
-      }
-    }
-  }
-
-  if (!segments.length) {
-    log.warn('stitch: no connectors built; falling back to CH-only');
-    const ch = await buildCHOnlyRoute(start, end, vias, log);
-    ch.evidence = ch.evidence.concat([{ type:'auto_anchors', ref:'0' }]);
-    return ch;
-  }
-
-  // append track segments when endpoints are close
-  const merged=[]; let selIdx=0;
-  for (const seg of segments){
-    merged.push(seg);
-    const track = selected[selIdx];
-    const endPt = seg.coords[seg.coords.length-1];
-    if (track && distKm(endPt, track.coords[0]) < JOIN_RADIUS_KM) {
-      const trackKm = polylineLenKm(track.coords);
-      log.info({ id: track.id, km: trackKm, attach_radius_km: JOIN_RADIUS_KM }, 'stitch: attach track');
-      merged.push({type:'track', id:track.id, coords:track.coords});
-      selIdx++;
-    }
-  }
-
-  // merge to one polyline + collect autoAnchors for evidence
-  const coords = [];
-  const autoAnchors = [];
-  if (merged.length) coords.push(merged[0].coords[0]);
-  for (const seg of merged) {
-    const c = seg.coords.slice(1);
-    coords.push(...c);
-    if (seg.type === 'track' && seg.coords?.length) autoAnchors.push(seg.coords[0]);
-  }
-
-  const evidence = [{ type:'GH_mode', ref:'STITCH' }];
-  if (autoAnchors.length) {
-    evidence.push({ type:'auto_anchors', ref:String(autoAnchors.length) });
-    return { coords, evidence, autoAnchors };
-  }
-  log.warn('stitch: no tracks attached; falling back to CH-only');
-  const ch = await buildCHOnlyRoute(start, end, vias, log);
-  ch.evidence = ch.evidence.concat([{ type:'auto_anchors', ref:'0' }]);
-  return ch;
-}
-
-/* ========= API ========= */
-app.post('/plan', async (req, res) => {
-  const requestId = nanoid();
-  const log = logger.child({ requestId });
-  try {
-    const {
-      start,
-      end,
-      vias = [],
-      distance_km_target,
-      time_budget_h,
-      region_hint_bbox,
-      strategy = 'ch',
-      off_pavement_target,
-      loop,
-      avoid_motorways,
-      avoid_tolls,       // kept for future
-      prefer_surfaces,   // kept for future
-      avoid_surfaces     // kept for future
-    } = validatePlan(req.body);
-
-    let a = await parsePointOrGeocode(start);
-    let b = await parsePointOrGeocode(end);
-    const viaPts = [];
-    for (const v of vias) viaPts.push(await parsePointOrGeocode(v));
-
-    // loop-friendly: avoid identical start/end for CH
-    if (loop && sameCoordinate(a, b, 10)) {
-      b = jitterPoint(b, 11);
-    }
-
-    const off = Math.max(0, Math.min(0.9, Number(off_pavement_target ?? 0.3)));
-    const avgSpeedKmh = (1 - off) * 50 + off * 30;
-    const kmTarget = Number(distance_km_target) > 0
-      ? Number(distance_km_target)
-      : (Number(time_budget_h) > 0 ? Math.max(15, Math.min(400, Number(time_budget_h) * avgSpeedKmh)) : 80);
-
-    const { bbox: autoBbox, padKm, areaKm2, shrunk } = corridorBBox(a, b, { PAD_KM_MIN, PAD_KM_MAX, BBOX_AREA_MAX_KM2 });
-    let bbox = autoBbox;
-    if (Array.isArray(region_hint_bbox) && region_hint_bbox.length === 4) {
-      const userBbox = region_hint_bbox.map(Number);
-      const userArea = bboxAreaKm2(userBbox);
-      if (userArea <= areaKm2 && userArea <= BBOX_AREA_MAX_KM2) {
-        bbox = userBbox;
-      } else {
-        log.info({ clamped: true, userArea }, 'supplied bbox too large');
-      }
-    }
-    log.info({ pad_km: padKm, bbox_area_km2: bboxAreaKm2(bbox), shrunk, avoid_motorways: !!avoid_motorways }, 'corridor');
-
-    const tracksPromise = overpassTracks(bbox).catch((e) => {
-      log.warn({ err: String(e) }, 'overpass failed; proceeding without tracks');
-      return [];
-    });
-    let minorPromise = Promise.resolve([]);
-    if (avoid_motorways) {
-      minorPromise = minorRoadAnchors(bbox, [a, ...viaPts, b]).catch((e) => {
-        log.warn({ err: String(e) }, 'minor-road anchors failed');
-        return [];
-      });
-    }
-    const [tracks, minorAnchors] = await Promise.all([tracksPromise, minorPromise]);
-    if (minorAnchors.length) viaPts.push(...minorAnchors);
-    log.info({ count: minorAnchors.length }, 'stitch: minor-road anchors');
-
-    const dynCap = STITCH_MAX_TRACKS > 0 ? STITCH_MAX_TRACKS : Infinity;
-    const dynMaxTracks = Math.max(1, Math.min(dynCap, Math.ceil(kmTarget / 60)));
-    const axisKm = Math.max(4, Math.min(8, kmTarget / 25));
-
-    let coords, note;
-    let evidence = [];
-
-    if (strategy === 'stitch') {
-      try {
-        const built = await buildStitchedRoute(a, b, viaPts, tracks, dynMaxTracks, axisKm, log, { avoid_motorways });
-        coords = built.coords;
-        evidence = built.evidence;
-        note = `STITCH mode: CH connectors + OSM tracks. Corridor ~${padKm.toFixed(0)}km pad, kmTarget≈${kmTarget.toFixed(0)}.`;
-      } catch (err) {
-        log.error({ err: String(err) }, 'stitch failed; falling back to CH-only');
-        const built = await buildCHOnlyRoute(a, b, viaPts, log);
-        coords = built.coords;
-        evidence = built.evidence.concat([{ type:'auto_anchors', ref:'0' }]);
-        note = `CH fallback: connectors only. Corridor ~${padKm.toFixed(0)}km pad, kmTarget≈${kmTarget.toFixed(0)}.`;
-      }
-    } else {
-      const built = await buildCHOnlyRoute(a, b, viaPts, log);
-      coords = built.coords;
-      evidence = built.evidence;
-      note = 'CH mode: standard routing (free plan).';
-    }
-
-    const routeId = nanoid();
-    const gpx = toGPX('ADV Route', coords);
-    const gpxUrl = await uploadToSupabase(`routes/${routeId}.gpx`, Buffer.from(gpx), 'application/gpx+xml');
-    const geojsonBlob = Buffer.from(JSON.stringify({ type:'Feature', properties:{ name:'ADV Route' }, geometry:{ type:'LineString', coordinates: coords }}));
-    const geojsonUrl = await uploadToSupabase(`routes/${routeId}.geojson`, geojsonBlob, 'application/geo+json');
-
-    const previewUrl  = PUBLIC_BASE_URL ? `${PUBLIC_BASE_URL}/v/${routeId}` : null;
-    const prettyGpx   = PUBLIC_BASE_URL ? `${PUBLIC_BASE_URL}/download/route/${routeId}.gpx` : gpxUrl;
-    const prettyGeo   = PUBLIC_BASE_URL ? `${PUBLIC_BASE_URL}/download/route/${routeId}.geojson` : geojsonUrl;
-
-    res.json({
-      routes: [{
-        id: routeId,
-        name: strategy === 'stitch' ? 'ADV Option (Stitched)' : 'ADV Option (CH)',
-        summary: note,
-        stats: { distance_km: +polylineLenKm(coords).toFixed(1), duration_h: null, ascent_m: null },
-        gpx_url: gpxUrl,
-        geojson_url: geojsonUrl,
-        preview_url: previewUrl,
-        pretty_gpx_url: prettyGpx,
-        pretty_geojson_url: prettyGeo,
-        custom_model_used: null,
-        via_points_used: [a, ...viaPts, b],
-        km_target_used: +kmTarget.toFixed(1),
-        corridor_pad_km: +padKm.toFixed(1)
-      }],
-      evidence
-    });
-  } catch (e) {
-    if (e instanceof ZodError) return res.status(400).json({ error: e.message });
-    logger.error(e);
-    res.status(500).json({ error: String(e) });
-  }
-});
-
-/* ========= DOWNLOAD & PREVIEW ========= */
-app.get('/download/route/:id.:ext', async (req, res) => {
-  try {
-    const { id, ext } = req.params;
-    if (!['gpx', 'geojson'].includes(ext)) return res.status(400).send('bad extension');
-    const path = `routes/${id}.${ext}`;
-    const url = await storageUrlFor(path);
-    if (!url) return res.status(404).send('not found');
-    return res.redirect(302, url);
-  } catch (e) {
-    console.error(e);
-    res.status(500).send('server error');
-  }
-});
-
-app.get('/v/:id', async (req, res) => {
-  try {
-    const { id } = req.params;
-    const geoUrl = await storageUrlFor(`routes/${id}.geojson`);
-    if (!geoUrl) return res.status(404).send('route not found');
-
-    const prettyGpx  = PUBLIC_BASE_URL ? `${PUBLIC_BASE_URL}/download/route/${id}.gpx` : geoUrl;
-    const prettyGeo  = PUBLIC_BASE_URL ? `${PUBLIC_BASE_URL}/download/route/${id}.geojson` : geoUrl;
-
-    res.set('content-type', 'text/html; charset=utf-8').send(`<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>ADV Route – ${id}</title>
-  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
-  <style>
-    html, body { height:100%; margin:0; }
-    #map { position:absolute; inset:0; }
-    .panel {
-      position:absolute; left:0; right:0; bottom:0;
-      display:flex; gap:.5rem; justify-content:center; flex-wrap:wrap;
-      padding:.6rem; background: rgba(255,255,255,.92);
-      box-shadow: 0 -4px 12px rgba(0,0,0,.12);
-      font: 14px/1.2 system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif;
-    }
-    .btn {
-      text-decoration:none; padding:.55rem .8rem; border-radius:10px;
-      border:1px solid #ccc; background:#fff; color:#111;
-    }
-  </style>
-</head>
-<body>
-  <div id="map"></div>
-  <div class="panel">
-    <a class="btn" href="${prettyGpx}" target="_blank">Download GPX</a>
-    <a class="btn" href="${prettyGeo}" target="_blank">Download GeoJSON</a>
-  </div>
-
-  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
-  <script>
-    const map = L.map('map', { zoomControl: true });
-    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
-      maxZoom: 19, attribution: '&copy; OpenStreetMap'
-    }).addTo(map);
-
-    fetch(${JSON.stringify(geoUrl)})
-      .then(r => r.json())
-      .then(geo => {
-        const layer = L.geoJSON(geo, { style: { weight: 4, opacity: .9 } }).addTo(map);
-        try { map.fitBounds(layer.getBounds(), { padding: [24,24] }); }
-        catch { map.setView([38.72,-9.14], 12); }
-      })
-      .catch(() => map.setView([38.72,-9.14], 12));
-  </script>
-</body>
-</html>`);
-  } catch (e) {
-    console.error(e);
-    res.status(500).send('server error');
-  }
-});
-
-app.post('/refine', async (req, res) => {
-  req.url = '/plan';
-  app._router.handle(req, res, () => {});
-});
-
-app.get('/health', (_, res) => res.json({ ok: true }));
 
 const PORT = process.env.PORT || 8080;
-app.listen(PORT, () =>
-  console.log(`ADV backend on :${PORT} | GH_MAX_RPS=${GH_MAX_RPS} | JOIN_RADIUS_M=${JOIN_RADIUS_M} | STITCH_MAX_TRACKS=${STITCH_MAX_TRACKS || '∞'}`)
-);
+const GH_KEY = need("GRAPHOPPER_API_KEY");
+const GH_ROUTE_URL = process.env.GRAPHOPPER_ROUTE_URL || "https://graphhopper.com/api/1/route";
+const GH_GEOCODE_URL = process.env.GRAPHOPPER_GEOCODE_URL || "https://graphhopper.com/api/1/geocode";
+
+const SUPABASE_URL = need("SUPABASE_URL");
+const SUPABASE_KEY = need("SUPABASE_SERVICE_ROLE_KEY", need("SUPABASE_ANON_KEY")); // prefer service role if available
+const SUPABASE_BUCKET = process.env.SUPABASE_BUCKET || "adv-routes";
+const PUBLIC_BASE = process.env.PUBLIC_BASE || ""; // e.g., "https://adv-route-backend.onrender.com"
+const PREVIEW_BASE = PUBLIC_BASE || ""; // same as PUBLIC_BASE if set
+
+// Stitch controls
+const STITCH_TIME_BUDGET_MS = (parseInt(process.env.STITCH_TIME_BUDGET_MS, 10) || 25000);
+const MAX_RESCUE_ATTEMPTS_PER_PAIR = (parseInt(process.env.MAX_RESCUE_ATTEMPTS_PER_PAIR, 10) || 6);
+const MAX_RESCUE_ATTEMPTS_TOTAL = (parseInt(process.env.MAX_RESCUE_ATTEMPTS_TOTAL, 10) || 60);
+const STITCH_DEFAULT_MAX_TRACKS = (parseInt(process.env.STITCH_MAX_TRACKS, 10) || 400);
+const OVERPASS_TIMEOUT_S = (parseInt(process.env.OVERPASS_TIMEOUT_S, 10) || 25);
+const OVERPASS_URL = process.env.OVERPASS_URL || "https://overpass-api.de/api/interpreter";
+
+// Misc
+const VEHICLE_PROFILE = process.env.GH_PROFILE || "car"; // CH plan-safe
+const MAX_POINTS_PER_GH = 5;
+
+// ----- Clients -----
+const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
+
+// ----- App setup -----
+const app = express();
+app.use(express.json({ limit: "1mb" }));
+
+// ----- Logging -----
+function log(level, msg, extra = {}) {
+  // level: 20=debug, 30=info, 40=warn, 50=error
+  const payload = {
+    level,
+    time: Date.now(),
+    pid: process.pid,
+    hostname: process.env.RENDER_INSTANCE_ID || process.env.HOSTNAME || "local",
+    msg,
+    ...extra,
+  };
+  // Render likes single-line JSON
+  console.log(JSON.stringify(payload));
+}
+
+function genId(n = 12) {
+  return crypto.randomBytes(n).toString("base64url").replace(/[^a-zA-Z0-9_-]/g, "").slice(0, n);
+}
+
+// ----- Small utils -----
+function coordsFromString(s) {
+  // "lat,lon" or "lon,lat" — we accept both but default to "lat,lon"
+  const parts = (s || "").split(",").map(x => parseFloat(x.trim()));
+  if (parts.length !== 2 || parts.some(Number.isNaN)) return null;
+  // Heuristic: |lat| <= 90, |lon| <= 180; if first is > 90 in abs, swap
+  let lat = parts[0], lon = parts[1];
+  if (Math.abs(lat) > 90 || Math.abs(lon) > 180) {
+    // try swapped
+    lat = parts[1]; lon = parts[0];
+  }
+  return { lat, lon };
+}
+
+function kmToDeg(km) {
+  // rough conversion ~ 111 km per degree lat
+  return km / 111.0;
+}
+
+function bboxFromPoints(points, padKm) {
+  let minLat = +Infinity, minLon = +Infinity, maxLat = -Infinity, maxLon = -Infinity;
+  for (const p of points) {
+    if (!p) continue;
+    minLat = Math.min(minLat, p.lat);
+    minLon = Math.min(minLon, p.lon);
+    maxLat = Math.max(maxLat, p.lat);
+    maxLon = Math.max(maxLon, p.lon);
+  }
+  const pad = kmToDeg(padKm || 8);
+  return {
+    s: minLat - pad,
+    w: minLon - pad,
+    n: maxLat + pad,
+    e: maxLon + pad,
+  };
+}
+
+function metersToKm(m) { return Math.round((m / 1000) * 10) / 10; }
+function secToHours(s) { return Math.round((s / 3600) * 100) / 100; }
+
+async function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+// ----- Geocoding (fallback if strings are provided) -----
+async function geocodePlace(q) {
+  const url = new URL(GH_GEOCODE_URL);
+  url.searchParams.set("q", q);
+  url.searchParams.set("locale", "en");
+  url.searchParams.set("limit", "1");
+  url.searchParams.set("key", GH_KEY);
+
+  const res = await fetch(url.toString());
+  if (!res.ok) throw new Error(`Geocode failed ${res.status}`);
+  const data = await res.json();
+  const hit = data.hits && data.hits[0];
+  if (!hit) throw new Error(`Geocode: no results for "${q}"`);
+  return { lat: hit.point.lat, lon: hit.point.lng };
+}
+
+// ----- GraphHopper CH route (chunked) -----
+async function ghRouteCH(points, requestId) {
+  if (!points || points.length < 2) throw new Error("ghRouteCH: need >= 2 points");
+
+  // chunk into groups of MAX_POINTS_PER_GH with overlap of 1
+  const chunks = [];
+  let i = 0;
+  while (i < points.length - 1) {
+    const end = Math.min(i + MAX_POINTS_PER_GH - 1, points.length - 1);
+    const slice = points.slice(i, end + 1);
+    chunks.push(slice);
+    if (end === points.length - 1) break;
+    i = end; // overlap last point
+  }
+
+  let allCoords = [];
+  let allDistance = 0;
+  let allTime = 0;
+
+  for (let idx = 0; idx < chunks.length; idx++) {
+    const pts = chunks[idx];
+    const url = new URL(GH_ROUTE_URL);
+
+    // Build query params
+    url.searchParams.set("profile", VEHICLE_PROFILE);
+    url.searchParams.set("points_encoded", "false");
+    url.searchParams.set("locale", "en");
+    url.searchParams.set("algorithm", "ch");
+    url.searchParams.set("key", GH_KEY);
+
+    pts.forEach(p => {
+      url.searchParams.append("point", `${p.lat},${p.lon}`);
+    });
+
+    const res = await fetch(url.toString());
+    if (!res.ok) {
+      const txt = await res.text().catch(() => "");
+      log(50, "gh route chunk failed", { requestId, status: res.status, body: txt.slice(0, 300) });
+      throw new Error(`GraphHopper CH route error ${res.status}`);
+    }
+    const data = await res.json();
+
+    const path = data.paths && data.paths[0];
+    if (!path || !path.points || !path.points.coordinates) {
+      throw new Error("GraphHopper: no path/points");
+    }
+    const coords = path.points.coordinates; // [lon,lat] pairs
+    const distance = path.distance || 0;
+    const time = path.time || 0;
+
+    // merge coords; remove duplicate of overlap
+    if (allCoords.length > 0 && coords.length > 0) {
+      coords.shift(); // drop first point to avoid duplicate
+    }
+    allCoords = allCoords.concat(coords);
+    allDistance += distance;
+    allTime += time;
+  }
+
+  return {
+    coordinates: allCoords, // [lon, lat]
+    distance_m: allDistance,
+    time_ms: allTime,
+  };
+}
+
+// ----- Overpass helpers (capped & retry/shrink) -----
+async function fetchTracksInBbox(bbox, opts = {}, requestId) {
+  const timeoutS = opts.timeout_s || OVERPASS_TIMEOUT_S;
+  const maxWays = Math.max(50, Math.min(opts.max_tracks || STITCH_DEFAULT_MAX_TRACKS, 1000));
+
+  // Keep the filter compact; prefer gravel/dirt-ish surfaces
+  const query = `
+    [out:json][timeout:${timeoutS}];
+    (
+      way
+        ["highway"~"track|path|unclassified|tertiary|secondary|service"]
+        ( ${bbox.s}, ${bbox.w}, ${bbox.n}, ${bbox.e} )
+        ["motorroad"!="yes"];
+    );
+    out center ${maxWays};
+  `.trim();
+
+  const res = await fetch(OVERPASS_URL, {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({ data: query }).toString(),
+  });
+
+  if (!res.ok) {
+    const txt = await res.text().catch(() => "");
+    log(40, "overpass non-OK", { requestId, status: res.status, body: txt.slice(0, 240) });
+    throw new Error(`Overpass error ${res.status}`);
+  }
+  const data = await res.json();
+  const centers = [];
+  if (data && Array.isArray(data.elements)) {
+    for (const el of data.elements) {
+      if (el.type === "way" && el.center) {
+        centers.push({ lat: el.center.lat, lon: el.center.lon, id: el.id });
+      }
+    }
+  }
+  return centers.slice(0, maxWays);
+}
+
+async function overpassWithRetryShrink(allPoints, padKm, opts, requestId) {
+  // Try with padKm, then shrink pad if failing, then reduce max tracks
+  const pads = [padKm, Math.max(4, padKm - 2), Math.max(2, padKm - 4)];
+  const caps = [opts.max_tracks || STITCH_DEFAULT_MAX_TRACKS, 300, 200, 150];
+
+  for (const pad of pads) {
+    const bbox = bboxFromPoints(allPoints, pad);
+    for (const cap of caps) {
+      try {
+        const centers = await fetchTracksInBbox(bbox, { timeout_s: opts.timeout_s, max_tracks: cap }, requestId);
+        return { centers, bbox, pad, cap };
+      } catch (e) {
+        log(40, "overpass retry", { requestId, pad, cap, err: (e && e.message) || String(e) });
+        await sleep(500);
+      }
+    }
+  }
+  throw new Error("Overpass failed after retries");
+}
+
+// ----- Simple axis share for ordering -----
+function axisShare(a, b, p) {
+  // Project p onto segment ab, return 0..1 along the axis
+  const ax = a.lon, ay = a.lat;
+  const bx = b.lon, by = b.lat;
+  const px = p.lon, py = p.lat;
+
+  const abx = bx - ax, aby = by - ay;
+  const apx = px - ax, apy = py - ay;
+  const ab2 = abx * abx + aby * aby;
+  if (ab2 === 0) return 0;
+  const t = Math.max(0, Math.min(1, (apx * abx + apy * aby) / ab2));
+  return t;
+}
+
+// ----- GPX / GeoJSON builders -----
+function buildGeoJSONLine(coordinates) {
+  // coordinates as [lon,lat]
+  return JSON.stringify({
+    type: "FeatureCollection",
+    features: [
+      { type: "Feature", geometry: { type: "LineString", coordinates }, properties: {} },
+    ],
+  });
+}
+
+function buildGPX(coordinates) {
+  // very simple GPX 1.1 with trkseg
+  const header = `<?xml version="1.0" encoding="UTF-8"?>
+<gpx version="1.1" creator="adv-route-backend" xmlns="http://www.topografix.com/GPX/1/1">
+  <trk><name>ADV Route</name><trkseg>`;
+  const pts = coordinates.map(([lon, lat]) => `    <trkpt lat="${lat.toFixed(6)}" lon="${lon.toFixed(6)}"></trkpt>`).join("\n");
+  const footer = `  </trkseg></trk></gpx>`;
+  return `${header}\n${pts}\n${footer}`;
+}
+
+// ----- Supabase uploads -----
+async function uploadRouteArtifacts(id, coordinates) {
+  const geojson = buildGeoJSONLine(coordinates);
+  const gpx = buildGPX(coordinates);
+
+  const geoPath = `routes/${id}.geojson`;
+  const gpxPath = `routes/${id}.gpx`;
+
+  const up1 = await supabase.storage.from(SUPABASE_BUCKET).upload(geoPath, Buffer.from(geojson), {
+    contentType: "application/geo+json",
+    upsert: true,
+  });
+  if (up1.error) throw up1.error;
+
+  const up2 = await supabase.storage.from(SUPABASE_BUCKET).upload(gpxPath, Buffer.from(gpx), {
+    contentType: "application/gpx+xml",
+    upsert: true,
+  });
+  if (up2.error) throw up2.error;
+
+  const { data: pub1 } = supabase.storage.from(SUPABASE_BUCKET).getPublicUrl(geoPath);
+  const { data: pub2 } = supabase.storage.from(SUPABASE_BUCKET).getPublicUrl(gpxPath);
+
+  return {
+    geojson_url: pub1.publicUrl,
+    gpx_url: pub2.publicUrl,
+  };
+}
+
+// ----- CH plan -----
+async function planCHRoute(allPoints, requestId) {
+  const gh = await ghRouteCH(allPoints, requestId);
+  const id = genId();
+  const uploaded = await uploadRouteArtifacts(id, gh.coordinates);
+  const distance_km = metersToKm(gh.distance_m);
+  const duration_h = gh.time_ms ? secToHours(gh.time_ms / 1000) : null;
+
+  return {
+    id,
+    name: "ADV Option (CH)",
+    summary: "CH mode: standard routing (free plan).",
+    stats: { distance_km, duration_h, ascent_m: null },
+    gpx_url: uploaded.gpx_url,
+    geojson_url: uploaded.geojson_url,
+    preview_url: PREVIEW_BASE ? `${PREVIEW_BASE}/v/${id}` : `/v/${id}`,
+    pretty_gpx_url: PREVIEW_BASE ? `${PREVIEW_BASE}/download/route/${id}.gpx` : `/download/route/${id}.gpx`,
+    pretty_geojson_url: PREVIEW_BASE ? `${PREVIEW_BASE}/download/route/${id}.geojson` : `/download/route/${id}.geojson`,
+    custom_model_used: null,
+    via_points_used: allPoints.map(p => [p.lon, p.lat]),
+  };
+}
+
+// ----- Stitch with guards -----
+async function planStitchRoute(params, requestId) {
+  const t0 = Date.now();
+  const {
+    points, // [{lat,lon}...], includes start + vias + end
+    corridor_pad_km = 8,
+    stitch_max_tracks = STITCH_DEFAULT_MAX_TRACKS,
+    avoid_motorways = true,
+  } = params;
+
+  // 1) Fetch candidate tracks with retry/shrink
+  let centers, bbox, usedPad, usedCap;
+  try {
+    const got = await overpassWithRetryShrink(points, corridor_pad_km, { timeout_s: OVERPASS_TIMEOUT_S, max_tracks: stitch_max_tracks }, requestId);
+    centers = got.centers; bbox = got.bbox; usedPad = got.pad; usedCap = got.cap;
+  } catch (e) {
+    // Overpass hard fail → fallback to CH immediately
+    log(40, "stitch overpass failed, falling back to CH", { requestId, err: e.message || String(e) });
+    const route = await planCHRoute(points, requestId);
+    return {
+      routes: [route],
+      evidence: [{ type: "stitch_error", detail: "overpass_failed" }, { type: "GH_mode", ref: "CH" }],
+    };
+  }
+
+  if (!centers || centers.length === 0) {
+    log(40, "stitch no centers, fallback CH", { requestId });
+    const route = await planCHRoute(points, requestId);
+    return { routes: [route], evidence: [{ type: "stitch_error", detail: "no_tracks" }, { type: "GH_mode", ref: "CH" }] };
+  }
+
+  // 2) Order candidates roughly along the main axis
+  const A = points[0], B = points[points.length - 1];
+  centers.forEach(c => { c.share = axisShare(A, B, c); });
+  centers.sort((a, b) => a.share - b.share);
+
+  // 3) Build a sparse chain of via candidates (every ~N)
+  const step = Math.max(1, Math.floor(centers.length / 8)); // keep it light
+  const chain = [];
+  for (let i = 0; i < centers.length; i += step) chain.push(centers[i]);
+  // ensure we include start/end as control points
+  const controlPoints = [A, ...chain, B];
+
+  // 4) Connect with CH, with guarded motorway-rescue attempts
+  const totalRescueBudget = MAX_RESCUE_ATTEMPTS_TOTAL;
+  let rescueUsedTotal = 0;
+  const perPairAttempts = new Map(); // key => count
+  const perPairLastKeySeen = new Map(); // key => last key to detect stalling
+  const pathCoords = [];
+  let totalDist = 0, totalTime = 0;
+
+  for (let k = 0; k < controlPoints.length - 1; k++) {
+    const d = controlPoints[k];
+    const r = controlPoints[k + 1];
+
+    const pairKey = `${d.lon.toFixed(6)},${d.lat.toFixed(6)}|${r.lon.toFixed(6)},${r.lat.toFixed(6)}`;
+    const attemptBase = (perPairAttempts.get(pairKey) || 0);
+
+    const elapsed = Date.now() - t0;
+    if (elapsed > STITCH_TIME_BUDGET_MS) {
+      log(40, "stitch time budget exceeded; fallback on remaining", { requestId, elapsed });
+      // connect remaining in one CH call and exit
+      const remaining = controlPoints.slice(k);
+      try {
+        const gh = await ghRouteCH(remaining, requestId);
+        // merge
+        if (pathCoords.length > 0 && gh.coordinates.length > 0) gh.coordinates.shift();
+        pathCoords.push(...gh.coordinates);
+        totalDist += gh.distance_m;
+        totalTime += gh.time_ms;
+      } catch (e) {
+        // As a last resort, ignore remainder
+        log(40, "fallback CH on remainder failed", { requestId, err: e.message || String(e) });
+      }
+      break;
+    }
+
+    try {
+      const gh = await ghRouteCH([d, r], requestId);
+      // merge
+      if (pathCoords.length > 0 && gh.coordinates.length > 0) gh.coordinates.shift();
+      pathCoords.push(...gh.coordinates);
+      totalDist += gh.distance_m;
+      totalTime += gh.time_ms;
+      continue;
+    } catch (e) {
+      // If CH fails here (rare), we'll try guarded motorway-rescue variations
+    }
+
+    // --- Guarded motorway-rescue loop for this pair ---
+    let connected = false;
+    for (let attempt = attemptBase + 1; attempt <= attemptBase + MAX_RESCUE_ATTEMPTS_PER_PAIR; attempt++) {
+      const elapsed2 = Date.now() - t0;
+      if (elapsed2 > STITCH_TIME_BUDGET_MS) break;
+      if (rescueUsedTotal >= totalRescueBudget) break;
+
+      // Jitter the mid-point slightly to encourage alternate CH snaps
+      const share = axisShare(d, r, { lat: (d.lat + r.lat) / 2, lon: (d.lon + r.lon) / 2 });
+      // small random jitter ~ ~20-80 meters
+      const jitter = (Math.random() - 0.5) * kmToDeg(0.08);
+      const mid = {
+        lat: (d.lat + r.lat) / 2 + jitter,
+        lon: (d.lon + r.lon) / 2 - jitter,
+      };
+
+      const dedupKey = `${d.lon.toFixed(5)},${d.lat.toFixed(5)}|${r.lon.toFixed(5)},${r.lat.toFixed(5)}|${mid.lon.toFixed(5)},${mid.lat.toFixed(5)}`;
+      const lastSeen = perPairLastKeySeen.get(pairKey);
+      if (lastSeen === dedupKey && attempt > attemptBase + 1) {
+        // Stuck on identical mid; break early
+        log(40, "stitch rescue dedup break", { requestId, k, attempt, pairKey });
+        break;
+      }
+      perPairLastKeySeen.set(pairKey, dedupKey);
+
+      log(30, "stitch: motorway rescue", {
+        requestId, attempt: `${attempt}/${attemptBase + MAX_RESCUE_ATTEMPTS_PER_PAIR}`,
+        share: Number(share.toFixed(3)),
+        mid: `${mid.lat.toFixed(6)},${mid.lon.toFixed(6)}`,
+        d: `${d.lat.toFixed(6)},${d.lon.toFixed(6)}`,
+        r: `${r.lat.toFixed(6)},${r.lon.toFixed(6)}`
+      });
+
+      rescueUsedTotal++;
+
+      try {
+        const gh = await ghRouteCH([d, mid, r], requestId);
+        if (pathCoords.length > 0 && gh.coordinates.length > 0) gh.coordinates.shift();
+        pathCoords.push(...gh.coordinates);
+        totalDist += gh.distance_m;
+        totalTime += gh.time_ms;
+
+        // Persist attempts for the pair and break
+        perPairAttempts.set(pairKey, attempt);
+        connected = true;
+        break;
+      } catch (e) {
+        // try next attempt
+        perPairAttempts.set(pairKey, attempt);
+        await sleep(120); // tiny backoff
+      }
+
+      if (rescueUsedTotal >= totalRescueBudget) break;
+    }
+
+    if (!connected) {
+      // Could not connect this pair; try straight CH for remainder and exit
+      log(40, "stitch: pair could not be connected; fallback remainder CH", { requestId, pairKey });
+      try {
+        const remaining = [d, r];
+        const gh = await ghRouteCH(remaining, requestId);
+        if (pathCoords.length > 0 && gh.coordinates.length > 0) gh.coordinates.shift();
+        pathCoords.push(...gh.coordinates);
+        totalDist += gh.distance_m;
+        totalTime += gh.time_ms;
+      } catch (e) {
+        // swallow; proceed to next segment (gap)
+        log(40, "fallback pair CH failed", { requestId, err: e.message || String(e) });
+      }
+    }
+  }
+
+  // If we ended with no coords, do a full CH fallback
+  if (!pathCoords || pathCoords.length === 0) {
+    const route = await planCHRoute(points, requestId);
+    return {
+      routes: [route],
+      evidence: [
+        { type: "stitch_error", detail: "empty_path_after_rescue" },
+        { type: "GH_mode", ref: "CH" },
+      ],
+    };
+  }
+
+  const id = genId();
+  const uploaded = await uploadRouteArtifacts(id, pathCoords);
+  const distance_km = metersToKm(totalDist);
+  const duration_h = totalTime ? secToHours(totalTime / 1000) : null;
+
+  const route = {
+    id,
+    name: "ADV Option (stitch)",
+    summary: "Stitch mode: connectors between OSM tracks with guarded rescue.",
+    stats: { distance_km, duration_h, ascent_m: null },
+    gpx_url: uploaded.gpx_url,
+    geojson_url: uploaded.geojson_url,
+    preview_url: PREVIEW_BASE ? `${PREVIEW_BASE}/v/${id}` : `/v/${id}`,
+    pretty_gpx_url: PREVIEW_BASE ? `${PREVIEW_BASE}/download/route/${id}.gpx` : `/download/route/${id}.gpx`,
+    pretty_geojson_url: PREVIEW_BASE ? `${PREVIEW_BASE}/download/route/${id}.geojson` : `/download/route/${id}.geojson`,
+    custom_model_used: null,
+    via_points_used: points.map(p => [p.lon, p.lat]),
+    km_target_used: null,
+    corridor_pad_km: usedPad,
+  };
+
+  const ev = [{ type: "GH_mode", ref: "CH" }];
+  if (rescueUsedTotal > 0) ev.push({ type: "stitch_rescue_used", attempts: rescueUsedTotal, cap: MAX_RESCUE_ATTEMPTS_TOTAL, centers_used: (centers && centers.length) || 0, pad_km: usedPad, overpass_cap: usedCap });
+
+  return { routes: [route], evidence: ev };
+}
+
+// ----- Request parsing (supports coords) -----
+async function parsePointsFromBody(body) {
+  let start, end;
+  const vias = [];
+
+  if (body.start_coords && typeof body.start_coords.lat === "number" && typeof body.start_coords.lon === "number") {
+    start = { lat: body.start_coords.lat, lon: body.start_coords.lon };
+  } else if (body.start && typeof body.start === "string") {
+    const quick = coordsFromString(body.start);
+    start = quick || await geocodePlace(body.start);
+  }
+
+  if (body.end_coords && typeof body.end_coords.lat === "number" && typeof body.end_coords.lon === "number") {
+    end = { lat: body.end_coords.lat, lon: body.end_coords.lon };
+  } else if (body.end && typeof body.end === "string") {
+    const quick = coordsFromString(body.end);
+    end = quick || await geocodePlace(body.end);
+  }
+
+  if (!start || !end) throw new Error("Provide start/end or start_coords/end_coords");
+
+  if (Array.isArray(body.vias_coords)) {
+    for (const v of body.vias_coords) {
+      if (v && typeof v.lat === "number" && typeof v.lon === "number") vias.push({ lat: v.lat, lon: v.lon });
+    }
+  }
+  if (Array.isArray(body.vias) && body.vias.length > 0) {
+    for (const s of body.vias) {
+      if (typeof s !== "string") continue;
+      const quick = coordsFromString(s);
+      if (quick) vias.push(quick);
+      else vias.push(await geocodePlace(s));
+    }
+  }
+
+  return [start, ...vias, end];
+}
+
+// ----- Endpoints -----
+app.get("/health", async (req, res) => {
+  res.json({ ok: true, mode: "CH-only", time: new Date().toISOString() });
+});
+
+app.post("/plan", async (req, res) => {
+  const requestId = genId(8);
+  const body = req.body || {};
+  const strategy = (body.strategy || "ch").toLowerCase();
+
+  try {
+    const points = await parsePointsFromBody(body);
+    const avoid_motorways = Boolean(body.avoid_motorways);
+    const avoid_tolls = Boolean(body.avoid_tolls);
+    const prefer_gravel = Boolean(body.prefer_gravel);
+
+    log(30, "plan request", {
+      requestId,
+      strategy,
+      points: points.length,
+      avoid_motorways,
+      avoid_tolls,
+      prefer_gravel
+    });
+
+    if (strategy === "stitch") {
+      const result = await planStitchRoute({
+        points,
+        corridor_pad_km: Number(body.corridor_pad_km) || 8,
+        stitch_max_tracks: Number(body.stitch_max_tracks) || STITCH_DEFAULT_MAX_TRACKS,
+        avoid_motorways
+      }, requestId);
+
+      return res.json(result);
+    }
+
+    // default: CH
+    const route = await planCHRoute(points, requestId);
+    return res.json({ routes: [route], evidence: [{ type: "GH_mode", ref: "CH" }] });
+
+  } catch (e) {
+    log(50, "plan error", { requestId, err: e.message || String(e), stack: e.stack && e.stack.split("\n").slice(0, 3).join(" | ") });
+    res.status(400).json({ error: "plan_failed", detail: e.message || String(e) });
+  }
+});
+
+// Simple download proxy (redirect to public supabase URL)
+app.get("/download/route/:id.:ext", async (req, res) => {
+  const { id, ext } = req.params;
+  const key = `routes/${id}.${ext}`;
+  const { data } = supabase.storage.from(SUPABASE_BUCKET).getPublicUrl(key);
+  if (!data || !data.publicUrl) return res.status(404).send("Not found");
+  res.redirect(data.publicUrl);
+});
+
+// Basic Leaflet preview
+app.get("/v/:id", (req, res) => {
+  const { id } = req.params;
+  const geoKey = `routes/${id}.geojson`;
+  const { data } = supabase.storage.from(SUPABASE_BUCKET).getPublicUrl(geoKey);
+  if (!data || !data.publicUrl) return res.status(404).send("Not found");
+
+  const html = `<!doctype html>
+<html>
+<head>
+<meta charset="utf-8"/>
+<title>ADV Route ${id}</title>
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+<style>html,body,#map{height:100%;margin:0} #map{outline:none}</style>
+</head>
+<body>
+<div id="map"></div>
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script>
+  const map = L.map('map');
+  L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+    maxZoom: 19, attribution: '&copy; OpenStreetMap'
+  }).addTo(map);
+  fetch(${JSON.stringify(data.publicUrl)})
+    .then(r => r.json())
+    .then(fc => {
+      const layer = L.geoJSON(fc).addTo(map);
+      map.fitBounds(layer.getBounds(), { padding: [24,24] });
+    })
+    .catch(() => { alert('Failed to load route'); });
+</script>
+</body>
+</html>`;
+  res.setHeader("Content-Type", "text/html; charset=utf-8");
+  res.send(html);
+});
+
+app.listen(PORT, () => {
+  log(30, "server started", { port: PORT, mode: "CH-only" });
+});
